@@ -1,0 +1,4 @@
+# Keep the package LF everywhere. It is developed on Windows but the scripts
+# are plain text run through uv, and a checkout on Linux must not show every
+# line as changed.
+* text=auto eol=lf
