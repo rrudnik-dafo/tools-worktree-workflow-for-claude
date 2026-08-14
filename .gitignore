@@ -1,0 +1,3 @@
+# Bytecode from the scripts importing wt_lib as a sibling module.
+__pycache__/
+*.pyc
