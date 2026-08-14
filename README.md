@@ -1,414 +1,318 @@
-# Worktree-workflow для паралельних сесій Claude Code
+# Worktree Workflow for Claude Code
 
-Дозволяє тримати кілька вкладок Claude Code відкритими на одному репозиторії
-так, щоб вони не заважали одна одній, і акуратно завершувати роботу кожної.
+Keep several Claude Code tabs open on one repository without them overwriting
+each other's work — and finish each piece of work with one command.
 
-Універсальний: нічого проєктно-специфічного в коді немає. Усе, що відрізняється
-від репо до репо, лежить в одному файлі — `<репо>/.claude/wt.json`.
+> Ukrainian version with additional implementation notes: [README-uk.md](README-uk.md)
 
-## Як користуватися
+## What it is
 
-**На старті кожної сесії** (у репо, де є `.claude/wt.json`) Claude питає:
-«ізольований worktree чи прямо в main?» — і чекає відповіді **до першої зміни
-файлів**. Читати, шукати й відповідати можна без worktree; питання стосується
-лише змін.
+Claude Code lets you open many conversations at once. They all edit the **same
+files in the same directory**, so two tabs working in parallel can silently
+overwrite each other. A mass operation in one tab — a code generator, a
+formatter, a bulk import — rewrites files under the other tab while it is
+reasoning about them.
 
-Питання ставиться щоразу, а не «коли ризиковано», бо колізія не попереджає про
-себе заздалегідь: у цьому репо дві сесії вже затирали роботу одна одній, а
-масовий скрипт переписував дерево під живою сесією. Вибір має бути зроблений
-**до** першого редагування, інакше він запізнюється.
+This package puts each session in its own [git worktree](https://git-scm.com/docs/git-worktree):
+a separate directory with its own branch, sharing the repository's history.
+Edits in one session become invisible to the others until the work is finished
+and merged deliberately.
 
-| Команда | Що робить |
+It is not a wrapper around Claude Code and does not replace anything. It adds
+four lifecycle hooks and three slash commands.
+
+### What it gives you
+
+- **Isolation that is actually switched on.** The workflow asks at the start of
+  every session, before the first file is touched, instead of relying on you to
+  remember a command at the one moment it matters.
+- **A one-command finish.** `/done` commits, runs the project's checks, merges
+  into the base branch, removes the worktree and deletes the branch — local and
+  remote — after you confirm.
+- **An honest inventory.** Every session start lists the worktrees that exist,
+  what work each holds, and whether a session still appears to be attending it.
+- **Guardrails against the ways this goes wrong.** New files stop the finish
+  until you say they belong. A merge that would collide with uncommitted work in
+  the main checkout stops. Nothing is ever removed without your word.
+
+### What it does NOT do
+
+- It does not push to your base branch, ever. Merging is local; pushing `main`
+  stays your decision (or opt in with `pushAfterMerge`).
+- It does not remove a worktree that holds unmerged work.
+- It does not decide that work is finished. `/done` runs when you say so.
+
+## Requirements
+
+| | |
 |---|---|
-| `/wt [ім'я]` | Переводить поточну сесію в ізольований worktree |
-| `/done` | Завершує роботу: коміт → гейт → merge → прибирання |
-| `/wt-list` | Показує всі worktrees, що в них лежить і чи є жива сесія |
+| **Claude Code** | with hooks and the `EnterWorktree` tool (v2.1.49+) |
+| **git** | 2.37 or newer — needs `push.autoSetupRemote` |
+| **uv** | in `~/.local/bin/` or on `PATH` — every script runs through it |
+| **A git repository** | with at least one commit; a remote is optional |
+| **Disk space** | each worktree is a full checkout of your tracked tree |
 
-Типовий цикл:
+No Python packages to install: the scripts declare their own (empty)
+dependencies inline and `uv` handles the rest. No Node, no build step.
 
-```
-(на старті)         # «worktree чи main?» → обираєш worktree
-... працюємо ...
-/done               # dry-run: показує, що поїде
-                    # якщо є НОВІ файли — зупинка, поки не скажеш, які потрібні
-"готово"            # явне підтвердження — єдина ручна дія
-                    # далі автоматично:
-                    #   git add -A && git commit
-                    #   гейт з wt.json
-                    #   ExitWorktree
-                    #   git merge --no-ff у main
-                    #   git worktree remove + git branch -d
-```
+**Platforms.** Developed and tested on Windows 11. Everything is Python and
+plain git — no shell scripts — so macOS and Linux should work, but they have
+not been exercised. Windows-specific handling (drive-letter case, path
+separators) is present and harmless elsewhere.
 
-Після `/done` не лишається ні гілки, ні теки worktree — усе злито в базову
-гілку. Твоя участь — одне «готово».
-
-**`main` не пушиться автоматично** (`pushAfterMerge: false`). Merge локальний;
-коли пушити — вирішуєш ти. Увімкнути автопуш — одне поле в `wt.json`.
-
-### Чому `/done` двофазний
-
-Поки сесія в worktree, Claude Code **блокує** будь-який запис і git-редирект у
-головний checkout. Це та сама ізоляція, заради якої все й затівалося, і
-обходити її не можна. Тому merge неможливий зсередини worktree: посередині
-`/done` сесія виходить назовні (`ExitWorktree`) і вже звідти зливає.
-
-Технічно це «фаза 1 у worktree» → `ExitWorktree` → «фаза 2 в головному
-checkout». Дані між ними передаються через файл-естафету
-`~/.claude/wt-locks/<репо>/pending-merge.json`, бо після виходу worktree вже
-не є поточною текою.
-
-### Запобіжники перед merge
-
-Merge змінює файли в головному checkout — можливо, під іншою сесією. Тому
-перед злиттям перевіряється:
-
-| Ситуація | Що робить |
-|---|---|
-| головний checkout на іншій гілці + незакомічені зміни | **СТОП** — перемикання гілок могло б їх втратити |
-| ти вже на базовій гілці, але змінені файли перетинаються з тими, що приходять | **СТОП** зі списком конфліктних файлів |
-| у головному checkout працюють інші сесії | **попередження**, не блокування — рішення твоє |
-| конфлікт при самому merge | `merge --abort`, гілка й worktree цілі, нічого не втрачено |
-
-Жоден із цих стопів не обходиться автоматично — ні stash, ні коміт чужих
-змін. Про це є окреме правило в `policy.md`.
-
-### Якщо потрібен код-рев'ю замість злиття
-
-`"finish": "push"` у `wt.json` повертає стару поведінку: `/done` пушить гілку
-й лишає merge людині. worktree при цьому не видаляється.
-
-## Встановлення
-
-Потрібні `uv` (у `~/.local/bin/` або в `PATH`) і `git`.
+**Disk space is the one real cost.** A worktree materialises every tracked file.
+Check yours before opening several tabs:
 
 ```bash
-# подивитися, що зміниться, нічого не записуючи
-~/.local/bin/uv run --no-project ~/.claude/scripts/wt/install.py --check
+git ls-files | wc -l          # how many files
+du -sh .                      # rough upper bound
+```
 
-# встановити
+On a 3.4 GB repository, three parallel sessions cost about 10 GB of working
+files. The `.git` directory is shared and not duplicated.
+
+## Install
+
+Once per machine:
+
+```bash
+git clone https://github.com/rrudnik-dafo/tools-worktree-workflow-for-claude.git ~/.claude/scripts/wt
 ~/.local/bin/uv run --no-project ~/.claude/scripts/wt/install.py
 ```
 
-Це **один раз на ПК**. Команди, хуки й політика стають глобальними — діють у
-кожному проєкті на цій машині.
+To see what it would change without writing anything, add `--check`.
 
-Далі, з кореня кожного репо, де потрібна ізоляція:
+The installer:
+
+- copies the three slash commands into `~/.claude/commands/`;
+- inserts the behaviour rules into `~/.claude/CLAUDE.md`, between
+  `<!-- wt-policy:start -->` / `<!-- wt-policy:end -->` markers;
+- registers four hooks in `~/.claude/settings.json`, **with this machine's
+  absolute paths**;
+- verifies `git` and `uv` are present.
+
+It merges into existing settings rather than replacing them, recognising its own
+entries by the path to `wt_hook.py`, and re-running is idempotent.
+
+> Do not copy the folder between machines by hand. The hook paths in
+> `settings.json` contain your username, and a hook that fails to start reports
+> nothing at all — the workflow would simply be silently absent. Clone and run
+> the installer instead.
+
+Then, once per repository you want to use it in:
 
 ```bash
+cd /path/to/your/repo
 ~/.local/bin/uv run --no-project ~/.claude/scripts/wt/install.py --init-repo
 ```
 
-Створює `.claude/wt.json`, `.worktreeinclude` (усе закоментовано) і дописує
-`/.claude/worktrees/` у `.gitignore`. Наявні файли не чіпає. Підтримує
-`--check`.
+This creates `.claude/wt.json` (the only project-specific file), a commented
+`.worktreeinclude`, and adds `/.claude/worktrees/` to `.gitignore`. Existing
+files are left alone.
 
-Хуки діють з **нової** сесії — поточні вкладки їх не підхоплять.
+**Hooks take effect in new sessions.** Tabs already open will not pick them up.
 
-## Структура
+## How your work changes
 
-**Пакет — джерело правди.** Це те, що копіюють на інший ПК:
+Only in four places. Everything else about Claude Code stays the same.
 
-```
-~/.claude/scripts/wt/
-  install.py         # встановлення: команди, політика, хуки, перевірка оточення
-  policy.md          # правила поведінки → вставляється в ~/.claude/CLAUDE.md
-  commands/          # джерело слеш-команд
-    wt.md  done.md  wt-list.md
-  wt_lib.py          # ядро: git-плюмбінг, локи, інвентаризація worktrees
-  wt_hook.py         # усі лайфсайкл-хуки, одна точка входу
-  wt_create.py       # створення worktree (механіка /wt)
-  wt_status.py       # механіка /wt-list
-  wt_finish.py       # механіка /done
-  test_workflow.py   # наскрізний прогін усього циклу в тимчасовому репо
-  README.md          # цей файл
-```
+### 1. Every session starts with one question
 
-**Після будь-якої правки `wt_finish.py` чи `wt_lib.py` — запусти прогін:**
+In a repository that has `.claude/wt.json`, Claude asks before touching any
+file:
 
-```bash
-~/.local/bin/uv run --no-project ~/.claude/scripts/wt/test_workflow.py
-```
+> Working in an isolated worktree, or directly in main?
 
-Він створює одноразовий репозиторій і проганяє повний цикл: коміт, гейт,
-handover, merge, видалення worktree й гілки, плюс усі запобіжники (зупинка на
-untracked, падіння гейта). `/done` комітить, мержить, видаляє worktree і
-видаляє гілку — це не ті операції, які варто налагоджувати на справжній роботі.
+Reading, searching, and answering questions need no worktree — only file changes
+do. Answer "main" freely when you are just looking around.
 
-**Що з'являється після `install.py`** (копії — правити не тут):
+It asks **every time**, not only when it looks risky, because a collision gives
+no warning: by the time two tabs are editing the same file, the moment to choose
+isolation has passed. It does not re-ask after a context compaction or when you
+resume a session, and it does ask again after `/clear`, which usually means a new
+task.
+
+### 2. You see what is left over
+
+Alongside the question, existing worktrees are listed with what they hold:
 
 ```
-~/.claude/
-  commands/{wt,done,wt-list}.md   # копії з пакета
-  CLAUDE.md                       # + блок між <!-- wt-policy:start/end -->
-  settings.json                   # + 4 хуки зі шляхами цього ПК
+worktree-anchors-fix   [IN USE - do not touch]
+  .claude/worktrees/anchors-fix
+  3 commits ahead of origin/main, 2 uncommitted
+
+worktree-old-attempt   [quiet - ask before touching]
+  .claude/worktrees/old-attempt
+  empty - nothing to lose
 ```
 
-**Що створюється саме собою під час роботи:**
+The markers mean:
+
+| Marker | Meaning |
+|---|---|
+| `[THIS SESSION]` | you are inside it |
+| `[IN USE - do not touch]` | another session is working there **now** |
+| `[closed - session ended]` | its tab was closed cleanly |
+| `[quiet - ask before touching]` | no recent activity |
+| `[unknown - no data, ask]` | predates this workflow, or no signal |
+| `DIRECTORY MISSING` | git metadata only — the branch may still hold commits |
+
+`quiet` and `unknown` are questions, not verdicts: a tab left open but untouched
+looks identical to an abandoned one. Nothing is removed on their strength.
+
+### 3. Three commands
 
 ```
-~/.claude/
-  wt-locks/<репо>/<session-id>.json   # heartbeat-локи (поза репозиторіями!)
-  wt-events.log                       # лог SessionStart / SessionEnd
+/wt [name]     move this session into an isolated worktree
+/wt-list       show every worktree, what it holds, who is attending it
+/done          finish: commit, gate, merge, clean up
 ```
 
-## `wt.json` — проєктна частина
+`/wt` creates `.claude/worktrees/<name>` on branch `worktree-<name>`, branched
+from your repository's default branch, and copies in the gitignored files listed
+in `.worktreeinclude`. Without a name it generates a readable one.
+
+### 4. `/done` replaces the manual wrap-up
+
+It runs in two halves with your decision in between.
+
+**First, a dry run.** Nothing is written. You see what would be committed, which
+protected paths were touched, and which gate commands would run:
+
+```
+Worktree:  .claude/worktrees/anchors-fix
+Branch:    worktree-anchors-fix
+Uncommitted changes: 12
+  M   src/parser.py
+  ??  scratch-notes.txt
+Commits ahead of origin/main: 3
+
+PROTECTED PATHS TOUCHED -- review these before merging:
+  config/registry.lock
+```
+
+**Then it waits for you** to say the work is finished. Approval of something
+else does not count; silence does not count.
+
+**Then it executes:**
+
+```
+1. commit          (stops first if there are new untracked files)
+2. gate            (your project's checks; a failure stops here)
+3. ExitWorktree    (required — a worktree cannot merge into the main checkout)
+4. merge --no-ff   into the base branch
+5. cleanup         remove the worktree, delete the branch locally and on the remote
+```
+
+The order is deliberate: the commit happens **before** the gate, so a failing
+check never costs you work. If the gate fails, everything is committed, the
+worktree is intact, and nothing has been merged.
+
+## Project configuration
+
+`.claude/wt.json` is the only file that differs between repositories.
 
 ```json
 {
   "remote": "origin",
   "baseBranch": "main",
+  "gate": ["${UV} run tests/run_tests.py -q"],
+  "protectedPaths": ["**/*.lock"],
   "finish": "merge",
   "pushAfterMerge": false,
   "deleteWorktree": true,
-  "gate": ["uv run tools/verify_anchors.py --product acron --version 10.2"],
-  "protectedPaths": ["**/i18n.lock"],
   "staleMinutes": 45
 }
 ```
 
-- **`finish`** — `merge` (за замовчуванням) зливає в базову гілку й прибирає
-  за собою; `push` пушить гілку й лишає merge людині.
-- **`pushAfterMerge`** — чи пушити базову гілку одразу після merge. За
-  замовчуванням `false`: злиття локальне, публікація — окреме рішення.
-- **`deleteWorktree`** — чи видаляти worktree й гілку після merge.
-- **`gate`** — команди, які `/done` виконує **після коміту, перед мержем**.
-  Ненульовий вихід зупиняє merge; коміт уже зроблено, тож робота не
-  втрачається — просто нічого не зливається, поки не полагодиш. Порядок
-  навмисний: спершу зберегти роботу, потім перевіряти.
+| Key | Effect |
+|---|---|
+| `gate` | commands run after the commit, before the merge; non-zero stops the merge |
+| `protectedPaths` | `.gitignore`-syntax patterns surfaced for review — **never blocking** |
+| `finish` | `merge` (default) or `push` to leave merging to you |
+| `pushAfterMerge` | push the base branch after a successful merge |
+| `deleteWorktree` | remove the worktree and branch after merging |
+| `staleMinutes` | silence after which a session is reported `quiet` |
+| `baseBranch` | defaults to the remote's default branch |
 
-  `${UV}` замінюється на шлях до `uv` цієї машини. **Не прописуй абсолютний
-  шлях** — `wt.json` комітиться і поїде на ПК з іншим ім'ям користувача, а `~`
-  у `cmd.exe` не розкривається.
+`${UV}` in a gate command is replaced with this machine's `uv` path. Do not
+hard-code it — this file is committed and travels to machines with a different
+home directory, and `~` does not expand in `cmd.exe`.
 
-  Гейт має бути **швидким** — він виконується при кожному завершенні задачі.
-  Секунди — норма, хвилини — ні. Важке (повний імпорт, рендер) туди не місце:
-  такі перевірки запускають вручну, коли гілка справді їх потребує.
+Keep gate commands **fast**; they run on every finish. Seconds are fine, minutes
+are not. Heavy checks belong in CI or in a manual run.
 
-  У цьому репо гейт — `${UV} run tests/run_tests.py -q` (62 тести, миттєво).
-- **`protectedPaths`** — шляхи, які треба показати людині перед завершенням.
-  Нічого не блокують, лише підсвічуються в dry-run.
-- **`staleMinutes`** — після скількох хвилин тиші сесія вважається `quiet`.
+`.worktreeinclude` lists gitignored files to copy into each new worktree, in
+`.gitignore` syntax. Without it a worktree starts without your `.env` or MCP
+configuration — and says nothing about it, which surfaces much later as a
+mysteriously missing capability.
 
-Файлу немає → гейта немає, protectedPaths немає. Workflow працює далі.
+## Notes worth knowing
 
-## Як визначається, чи вкладка ще відкрита
+**A worktree isolates files, not git.** All worktrees share one `.git`, so
+commits, branches and remotes are common to all of them. Editing in a worktree
+is invisible to other sessions — but a `git push` is a push of the same
+repository.
 
-Списку відкритих вкладок VS Code не існує — його неможливо запитати. Тому
-використовуються два **незалежні** сигнали:
+**Pushing from a worktree is allowed and goes to that worktree's own branch.**
+The branch is created with `--no-track`, and `push.autoSetupRemote` is enabled
+for the repository, so the first `git push` creates `origin/worktree-<name>`.
+This is a useful backup mid-task. What must never happen is naming another
+destination explicitly (`git push origin HEAD:main`).
 
-1. **Власний heartbeat.** `UserPromptSubmit` і `Stop` оновлюють
-   `~/.claude/wt-locks/<репо>/<session-id>.json`. Свіжий лок = сесія жива.
-   `SessionEnd` не видаляє лок, а ставить у нього мітку `ended_at` — бо
-   видалений лок не відрізнити від лока, якого ніколи не було, а це
-   протилежні за змістом стани.
-2. **Час зміни транскриптів.** Claude Code веде окрему теку
-   `~/.claude/projects/<шлях-як-slug>/` на кожен робочий каталог, і worktree
-   отримує свою. Найсвіжіший `.jsonl` там показує останню активність —
-   **без жодної участі цього workflow і заднім числом**.
+**Merging while another session works in the main checkout is warned about, not
+blocked.** The merge changes files under that session. `/done` does stop when a
+file it is about to merge is also uncommitted in the main checkout, because that
+is a guaranteed loss rather than a risk.
 
-Другий сигнал критичний: без нього щойно встановлений workflow оголосив би
-всі наявні worktrees покинутими, бо жодного лока ще не існує. Саме так і
-сталося при першому запуску 2026-08-12 — активний сусідній таб був показаний
-як `idle`.
+**Liveness is inferred, not known.** There is no list of open editor tabs to
+query. Two signals are combined: this workflow's own heartbeat, refreshed on
+every prompt and every turn, and the modification time of Claude Code's session
+transcripts. A closed tab is detected precisely, through `SessionEnd`. An open
+but idle tab is indistinguishable from an abandoned one — hence `quiet` rather
+than a verdict.
 
-Плюс `git worktree list` (які worktrees існують) і `git status` + `rev-list`
-(скільки роботи в кожному).
+**Session locks live outside your repositories**, under `~/.claude/wt-locks/`,
+so no project needs a `.gitignore` entry for them.
 
-### Стани
+**Claude Code bugs this works around.** `EnterWorktree` compares paths without
+normalising Windows drive-letter case and can refuse to enter a worktree it just
+created ([#36194](https://github.com/anthropics/claude-code/issues/36194) covers
+the related upstream problem). This package therefore creates worktrees itself
+and passes git's own spelling of the path. A side effect: `ExitWorktree` will not
+remove such a worktree — which is intended, since `/done` owns removal.
 
-| Маркер | Що означає | Що робити |
-|---|---|---|
-| `[THIS SESSION]` | ти всередині | — |
-| `[IN USE - do not touch]` | інша сесія працює **зараз** | не чіпати нічого |
-| `[closed - session ended]` | сесія завершилась штатно | можна пропонувати дії |
-| `[quiet - ask before touching]` | давно немає активності | спитати |
-| `[unknown - no data, ask]` | створений до цього workflow | спитати |
-
-**Обмеження:** вкладка, відкрита але не використовувана понад `staleMinutes`,
-виглядає як `quiet`. Тому це привід запитати, а не підстава видаляти.
-Автоматичного видалення немає взагалі.
-
-### `SessionEnd` при закритті вкладки — працює (перевірено 2026-08-12)
-
-Документація цього не обіцяє, тому перевірялося емпірично. Кожен
-`SessionStart` і `SessionEnd` пише рядок у `~/.claude/wt-events.log`:
-
-```
-2026-08-12 14:13:19  session-start  session=b0b6f997  reason=startup  cwd=c:\Dev\GitBookTest
-2026-08-12 14:06:55  session-end    session=422674f8  reason=other    cwd=c:\Dev\GitBookTest
-```
-
-Закриття вкладок дає `session-end` з `reason=other`. Тому детекція точна, а
-heartbeat лишається страховкою на випадок аварійного завершення (kill, збій
-живлення), коли хук не встигає спрацювати.
-
-**Хибний `session-end` не «вбиває» живу сесію.** Іноді сесія завершується за
-секунди після старту (fork, rewind). Якщо після цього вона знову працює,
-черговий heartbeat перезаписує лок-файл цілком і мітка `ended_at` зникає —
-сесія повертається в стан «жива» сама, без втручання.
-
-## Інші проєкти на цьому ж ПК — переносити нічого не треба
-
-Команди, хуки й політика лежать у `~/.claude/`, а не в репозиторії. Тому
-`/wt`, `/done` і `/wt-list` **уже працюють у кожному проєкті** на цій машині,
-включно з тими, які ти створиш завтра. Копіювати щось у новий проєкт не
-потрібно.
-
-Три файли в репо — **необов'язкові**, це лише налаштування:
-
-| Файл | Без нього | Коли справді потрібен |
-|---|---|---|
-| `.claude/wt.json` | гейта немає, `protectedPaths` немає, remote = `origin` | коли є перевірки перед push або файли, що конфліктують при мержі |
-| `.worktreeinclude` | worktree стартує без gitignored файлів | коли є `.env` / `.mcp.json`, без яких проєкт неповний |
-| `/.claude/worktrees/` у `.gitignore` | worktrees видно як untracked | практично завжди — це єдине, що варто зробити одразу |
-
-Одна команда з кореня репо робить усі три:
+**Large repositories need patience on `/wt`.** Checking out a multi-gigabyte
+tree takes minutes; the timeout is 300 seconds (`WORKTREE_ADD_TIMEOUT` in
+`wt_create.py`). If it is exceeded, git is killed mid-initialisation and leaves
+the worktree holding its own lock:
 
 ```bash
-~/.local/bin/uv run --no-project ~/.claude/scripts/wt/install.py --init-repo
+git worktree unlock <path>
+git worktree remove --force <path>
 ```
 
-У не-git теках хуки тихо виходять і нічого не роблять.
+## Development
 
-## Перенесення на інший ПК
-
-Копіювати вручну **не можна**: у `settings.json` шляхи до хуків абсолютні й
-містять ім'я користувача (`C:/Users/RomanRudnyk/...`). На іншому ПК вони
-вказуватимуть в нікуди, а хуки, які не запускаються, нічого не повідомляють —
-workflow просто мовчки не працюватиме. Тому шляхи прописує інсталятор.
-
-**Два кроки:**
-
-1. Склонувати пакет у те саме місце (`C:\Users\<ім'я>\.claude\scripts\wt\`):
-
-   ```bash
-   git clone https://github.com/rrudnik-dafo/tools-worktree-workflow-for-claude.git ~/.claude/scripts/wt
-   ```
-
-2. Виконати:
-
-   ```bash
-   ~/.local/bin/uv run --no-project ~/.claude/scripts/wt/install.py
-   ```
-
-Оновлення потім — `git -C ~/.claude/scripts/wt pull`, і повторний
-`install.py`, якщо змінилися `policy.md`, `commands/` або перелік хуків.
-
-Інсталятор сам:
-
-- розкладе `commands/*.md` у `~/.claude/commands/`;
-- вставить `policy.md` у `~/.claude/CLAUDE.md` між маркерами
-  `<!-- wt-policy:start/end -->`;
-- впише чотири хуки в `~/.claude/settings.json` **зі шляхами цього ПК**;
-- перевірить наявність `uv` і `git`.
-
-Наявні налаштування не чіпаються: інсталятор мержить лише свої чотири записи,
-розпізнаючи їх за шляхом до `wt_hook.py`. Повторний запуск — ідемпотентний
-(оновлює блок, а не додає другий).
-
-Спершу подивитися, що зміниться, нічого не записуючи:
+After changing `wt_finish.py` or `wt_lib.py`, run the rehearsal:
 
 ```bash
-~/.local/bin/uv run --no-project ~/.claude/scripts/wt/install.py --check
+~/.local/bin/uv run --no-project ~/.claude/scripts/wt/test_workflow.py
 ```
 
-**Передумови на новому ПК:** `uv` у `~/.local/bin/` (або в `PATH`) і `git`.
+It builds a throwaway repository with a real remote and exercises the whole
+cycle — creation, the untracked stop, commit, gate, handover, merge, cleanup of
+both local and remote branches — plus the guards, and a negative control proving
+the upstream assertion is not vacuous. `/done` commits, merges, deletes a
+worktree and deletes a branch; those are not operations to debug on real work.
 
-**Після встановлення** в кожному репо треба ще три речі з попереднього розділу
-(`wt.json`, `.worktreeinclude`, рядок у `.gitignore`). Хуки діють з **нової**
-сесії.
+The package is the source of truth. Files under `~/.claude/commands/` and the
+block in `~/.claude/CLAUDE.md` are installed copies that `install.py` overwrites
+— edit the package, then reinstall.
 
-### Правки вносити в пакет, не у встановлені копії
+## Uninstall
 
-Джерело — `~/.claude/scripts/wt/`. Файли в `~/.claude/commands/` і блок у
-`CLAUDE.md` — встановлені копії, які перезаписує `install.py`. Якщо змінити
-копію, наступний запуск інсталятора її затре. Тому: правка в пакеті →
-`install.py`.
-
-## Типові проблеми
-
-**Зміни опинилися в `main` без жодного мержу.** Гілка worktree відстежувала
-`main`, тож `git push` з worktree летів прямо в `origin/main` — повз `/done`,
-повз гейт, повз усі перевірки. Причина: `git worktree add -b <гілка> <шлях>
-origin/main` при відгалуженні від **remote-tracking** гілки автоматично ставить
-її як upstream.
-
-Полагоджено двома кроками, і другий не менш важливий за перший:
-
-1. `--no-track` + зняття upstream — гілка більше не успадковує `main`.
-2. `push.autoSetupRemote=true` у репозиторії — перший `git push` створює
-   `origin/worktree-<name>` і прив'язується до неї.
-
-Разом це дає те, чого й очікуєш: **гілка пушить у свою гілку**. Одного лише
-першого кроку було замало — він лишав push узагалі без цілі, і доводилося
-підпирати це правилом «не пушити», тобто дисципліною замість механізму.
-
-`/done` після мержу видаляє гілку **і локально, і на сервері**, інакше
-`origin/worktree-*` накопичувалися б по одній на кожну виконану задачу.
-
-Тест має негативний контроль: він доводить, що без `--no-track` git цей
-upstream таки чіпляє, тож перевірка не стане хибно-зеленою.
-
-**Чому видалення гілки використовує `-D`, а не `-d`.** `git branch -d`
-порівнює гілку з її **upstream**, а не з базовою гілкою. Якщо запушити для
-бекапу, а потім ще попрацювати, локальна гілка випереджає `origin/...`, і `-d`
-відмовляється видаляти навіть після успішного мержу. Тому `/done` спершу
-перевіряє належність сам (`git merge-base --is-ancestor <гілка> <база>`) і лише
-тоді викликає `-D`. Якщо перевірка не пройшла — гілка лишається недоторканою.
-
-**`git worktree add` впав, а worktree лишився заблокованим.** У виводі —
-`git timed out after 300s`, у `git worktree list` — `locked initializing`.
-Це git заблокував теку на час викладання файлів і не встиг зняти блокування,
-бо його вбили посеред роботи. Знімається так:
-
-```bash
-git worktree unlock  <шлях>
-git worktree remove --force <шлях>
-```
-
-Ліміт живе в `WORKTREE_ADD_TIMEOUT` у `wt_create.py` (зараз 300 с). Для цього
-репозиторію (3,4 ГБ, 51 тис. файлів) 15-секундного дефолту не вистачало
-катастрофічно — саме він і був причиною.
-
-**`EnterWorktree` створив worktree, але відмовився в нього зайти.**
-Відомий баг Claude Code: він порівнює шлях створеного worktree з робочою
-текою сесії, не нормалізуючи регістр літери диска на Windows — `c:\Dev\x` і
-`C:/Dev/x` читаються як різні теки. Worktree при цьому справний.
-
-Саме через це `/wt` **не** дає `EnterWorktree` створювати worktree: спершу
-його створює `wt_create.py`, який друкує шлях у власному написанні git, і вже
-цей рядок передається в `EnterWorktree` дослівно. Якщо колись зіткнешся
-вручну — не створюй нічого вдруге, просто виклич `EnterWorktree` з явним
-шляхом.
-
-Побічний наслідок входу «за шляхом»: `ExitWorktree` такий worktree не
-видаляє. Це навмисно й на краще — прибирання належить `/done`, тож worktree
-зникає рівно в одному місці і лише після успішного мержу.
-
-**У worktree зникли MCP-сервери.** `.mcp.json` gitignored і не потрапив у
-worktree. Додай його в `.worktreeinclude` — `wt_create.py` копіює звідти
-файли при створенні, тож worktree доведеться перестворити.
-
-**«Blocked: command targets the main checkout».** Це не помилка, а ізоляція:
-сесія в worktree не має права писати в головний checkout. Merge треба робити
-з головного checkout, а не звідси.
-
-**`/done` каже, що сесія в MAIN checkout.** `/wt` не виконувався, або
-`EnterWorktree` не спрацював. Перевір `/wt-list`.
-
-**Гейт впав.** Робота закомічена, worktree цілий, merge не зроблено. Полагодь
-і запусти `/done` знову. `--skip-gate` існує, але це свідоме рішення людини.
-
-**`/done` зупинився на «STOP: the main checkout is on … with uncommitted
-changes».** У головному checkout є незакомічені зміни, а він не на базовій
-гілці. Закоміть або зроби stash **сам** — скрипт навмисно не чіпає чужі зміни.
-
-**`/done` обірвався між фазами.** Робота закомічена в гілці, естафета лежить у
-`~/.claude/wt-locks/<репо>/pending-merge.json`. Достатньо з головного checkout
-виконати `wt_finish.py --merge` — аргументи він візьме звідти. Файл видаляється
-після успішного merge.
-
-**Merge конфліктнув.** `merge --abort` уже виконано, нічого не втрачено: гілка
-й worktree на місці. Розв'яжи конфлікт (напр. змерж базову гілку в worktree) і
-повтори `/done`.
+Remove the four hook entries from `~/.claude/settings.json`, delete the block
+between the `wt-policy` markers in `~/.claude/CLAUDE.md`, and delete
+`~/.claude/commands/{wt,done,wt-list}.md`. Existing worktrees are ordinary git
+worktrees and keep working; remove them with `git worktree remove`.
