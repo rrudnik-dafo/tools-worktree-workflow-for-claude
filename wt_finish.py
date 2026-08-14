@@ -132,9 +132,43 @@ def match_protected(rel_path: str, patterns: list[str]) -> bool:
     return False
 
 
-def changed_files(worktree: Path) -> list[tuple[str, str]]:
-    """Return [(status, path)] from git status --porcelain."""
-    code, out, _ = wt_lib.run_git(["status", "--porcelain"], worktree)
+def merge_in_progress(main_checkout: Path) -> bool:
+    """Is a merge half-applied right now? (MERGE_HEAD exists)
+
+    The question to ask after any merge that did not return cleanly. git writes
+    MERGE_HEAD before touching the working tree and removes it when it commits,
+    so its presence marks the one genuinely dangerous state -- and its absence
+    means there is nothing for `git merge --abort` to abort.
+    """
+    code, _, _ = wt_lib.run_git(
+        ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"], main_checkout
+    )
+    return code == 0
+
+
+def branch_is_merged(main_checkout: Path, branch: str, base_local: str) -> bool:
+    """Is every commit of `branch` already contained in `base_local`?
+
+    Used both to verify a completed merge and to decide whether the branch can
+    be deleted. It asks about containment rather than about the upstream, which
+    is the question `git branch -d` asks and the wrong one here.
+    """
+    code, _, _ = wt_lib.run_git(
+        ["merge-base", "--is-ancestor", branch, base_local], main_checkout
+    )
+    return code == 0
+
+
+def changed_files(
+    worktree: Path, timeout: float = wt_lib.GIT_SCAN_TIMEOUT
+) -> list[tuple[str, str]]:
+    """Return [(status, path)] from git status --porcelain.
+
+    Scans the whole working tree, so it gets the scan-sized limit rather than
+    the query default: on a multi-GB repository with a cold cache this is
+    seconds to minutes, not milliseconds.
+    """
+    code, out, _ = wt_lib.run_git(["status", "--porcelain"], worktree, timeout=timeout)
     if code != 0:
         return []
     rows = []
@@ -239,7 +273,9 @@ def merge_phase(args) -> int:
 
     dirty = [path for _, path in changed_files(main_checkout)]
     code, out, _ = wt_lib.run_git(
-        ["diff", "--name-only", f"{base_local}...{branch}"], main_checkout
+        ["diff", "--name-only", f"{base_local}...{branch}"],
+        main_checkout,
+        timeout=wt_lib.GIT_SCAN_TIMEOUT,
     )
     incoming = [line.strip() for line in out.splitlines() if line.strip()]
 
@@ -260,9 +296,19 @@ def merge_phase(args) -> int:
             print(f"      Switching to '{base_local}' could lose them.")
             print("      Commit or stash them, then rerun.")
             return 1
-        code, _, err = wt_lib.run_git(["checkout", base_local], main_checkout)
+        # Switching branches rewrites the working tree, so it gets the write
+        # limit -- and a heads-up first, because on a large repository this is
+        # a silent multi-minute wait that otherwise reads as a hang.
+        print(f"Switching to {base_local} ... "
+              f"(waiting up to {wt_lib.GIT_WRITE_TIMEOUT // 60} minutes)")
+        code, _, err = wt_lib.run_git(
+            ["checkout", base_local], main_checkout, timeout=wt_lib.GIT_WRITE_TIMEOUT
+        )
         if code != 0:
             print(f"ERROR: could not switch to {base_local}: {err}")
+            if wt_lib.timed_out(err):
+                print("       git was killed midway, so the working tree may be")
+                print("       half-updated. Check `git status` before rerunning.")
             return 1
         print(f"Switched to {base_local}.")
     else:
@@ -293,24 +339,83 @@ def merge_phase(args) -> int:
         print("      Files there are about to change under them.")
 
     print()
+    print(f"Merging {len(incoming)} file(s) ... "
+          f"(waiting up to {wt_lib.GIT_WRITE_TIMEOUT // 60} minutes)")
+    started = time.time()
     code, out, err = wt_lib.run_git(
         ["merge", "--no-ff", branch, "-m", f"Merge worktree branch {branch}"],
         main_checkout,
+        timeout=wt_lib.GIT_WRITE_TIMEOUT,
     )
+    elapsed = time.time() - started
+
+    if code != 0 and wt_lib.timed_out(err):
+        # A TIMEOUT IS NOT A VERDICT. We killed git at an unknown point, so the
+        # exit code says nothing about what was done -- and this exact case has
+        # already misfired once: git had written the merge commit and was cut
+        # off on the way out, which was then reported as "MERGE FAILED" while
+        # the merge sat in the history. Ask the repository, not the exit code.
+        print(f"git merge did not return within {elapsed:.0f}s.")
+        print("Checking what state it actually left behind...")
+        if merge_in_progress(main_checkout):
+            print()
+            print("STOP: a merge is HALF-APPLIED in the main checkout.")
+            print("      Nothing here will touch it -- an automatic abort could")
+            print("      discard work that is only in the working tree.")
+            print("      Inspect, then choose one:")
+            print("        git status                 # see what is staged")
+            print(f"        git merge --abort          # back out, keep {branch}")
+            print("        git commit                 # finish the merge as-is")
+            print(f"      Afterwards rerun: wt_finish.py --merge --branch {branch}")
+            return 2
+        if branch_is_merged(main_checkout, branch, base_local):
+            # git finished the job and was killed on the way out. The merge is
+            # real; carry on into cleanup rather than crying failure.
+            print(f"The merge COMPLETED before git was killed -- {branch} is")
+            print(f"fully contained in {base_local}. Continuing with cleanup.")
+            code = 0
+        else:
+            print()
+            print("STOP: nothing was merged, and no merge is in progress.")
+            print("      git was killed early; the working tree may still be")
+            print("      mid-update. Check `git status`, then rerun:")
+            print(f"        wt_finish.py --merge --branch {branch}")
+            print(f"      If it times out again, raise GIT_WRITE_TIMEOUT in")
+            print("      wt_lib.py -- the current limit is "
+                  f"{wt_lib.GIT_WRITE_TIMEOUT // 60} minutes.")
+            return 2
+
     if code != 0:
         print("MERGE FAILED:")
         print((out + "\n" + err).strip())
-        # Leave no half-merged state behind; the branch and worktree survive.
-        wt_lib.run_git(["merge", "--abort"], main_checkout)
-        print()
-        print("Merge aborted. The branch and worktree are untouched --")
-        print("resolve the conflict manually, or rerun after rebasing.")
+        # Abort only when there is something to abort. Running --abort with no
+        # merge in progress just prints its own error over git's, burying the
+        # real reason the merge was refused.
+        if merge_in_progress(main_checkout):
+            wt_lib.run_git(
+                ["merge", "--abort"], main_checkout, timeout=wt_lib.GIT_WRITE_TIMEOUT
+            )
+            print()
+            print("Merge aborted. The branch and worktree are untouched --")
+            print("resolve the conflict manually, or rerun after rebasing.")
+        else:
+            print()
+            print("No merge was started, so there is nothing to abort.")
+            print("The branch and worktree are untouched.")
         return 2
-    print((out + "\n" + err).strip() or "Merged.")
+    print((out + "\n" + err).strip() or f"Merged in {elapsed:.0f}s.")
 
     if delete_worktree:
         print()
-        code, _, err = wt_lib.run_git(["worktree", "remove", str(worktree)], main_checkout)
+        # Removal deletes the whole checked-out tree -- several GB of small
+        # files on Windows, which is minutes, not seconds.
+        print(f"Removing worktree ... "
+              f"(waiting up to {wt_lib.GIT_WRITE_TIMEOUT // 60} minutes)")
+        code, _, err = wt_lib.run_git(
+            ["worktree", "remove", str(worktree)],
+            main_checkout,
+            timeout=wt_lib.GIT_WRITE_TIMEOUT,
+        )
         if code != 0:
             # Files copied in by .worktreeinclude are gitignored, so git counts
             # them as reasons to refuse removal. The tracked tree is committed
@@ -318,7 +423,9 @@ def merge_phase(args) -> int:
             # name them first: silently deleting a .env or an .mcp.json the
             # user had put there by hand is a nasty surprise.
             code2, ignored, _ = wt_lib.run_git(
-                ["status", "--porcelain", "--ignored=matching"], worktree
+                ["status", "--porcelain", "--ignored=matching"],
+                worktree,
+                timeout=wt_lib.GIT_SCAN_TIMEOUT,
             )
             doomed = [
                 line[3:].strip()
@@ -337,7 +444,9 @@ def merge_phase(args) -> int:
                 print(" main checkout. Say so now if any of them was hand-made.)")
 
             code, _, err2 = wt_lib.run_git(
-                ["worktree", "remove", "--force", str(worktree)], main_checkout
+                ["worktree", "remove", "--force", str(worktree)],
+                main_checkout,
+                timeout=wt_lib.GIT_WRITE_TIMEOUT,
             )
             if code != 0:
                 print(f"WARNING: could not remove the worktree: {err2 or err}")
@@ -352,10 +461,7 @@ def merge_phase(args) -> int:
         # different one -- it compares against the branch's UPSTREAM, so a
         # branch pushed for backup and then worked on further looks "not fully
         # merged" to it even when the work is safely in the base branch.
-        code, _, _ = wt_lib.run_git(
-            ["merge-base", "--is-ancestor", branch, base_local], main_checkout
-        )
-        if code != 0:
+        if not branch_is_merged(main_checkout, branch, base_local):
             print(f"WARNING: {branch} is NOT fully contained in {base_local};")
             print("         keeping it. Inspect before deleting anything:")
             print(f"           git log {base_local}..{branch}")
@@ -375,11 +481,13 @@ def merge_phase(args) -> int:
         code, _, _ = wt_lib.run_git(
             ["ls-remote", "--exit-code", "--heads", remote, branch],
             main_checkout,
-            timeout=60,
+            timeout=wt_lib.GIT_NETWORK_TIMEOUT,
         )
         if code == 0:
             code, out, err = wt_lib.run_git(
-                ["push", remote, "--delete", branch], main_checkout, timeout=120
+                ["push", remote, "--delete", branch],
+                main_checkout,
+                timeout=wt_lib.GIT_NETWORK_TIMEOUT,
             )
             if code == 0:
                 print(f"Deleted {remote}/{branch} (work is merged into {base_local}).")
@@ -389,7 +497,11 @@ def merge_phase(args) -> int:
 
     if push_after:
         print()
-        code, out, err = wt_lib.run_git(["push", remote, base_local], main_checkout)
+        code, out, err = wt_lib.run_git(
+            ["push", remote, base_local],
+            main_checkout,
+            timeout=wt_lib.GIT_NETWORK_TIMEOUT,
+        )
         if code != 0:
             print(f"WARNING: push of {base_local} failed: {err or out}")
         else:
@@ -462,7 +574,9 @@ def main() -> int:
         return 1
 
     files = changed_files(worktree)
-    state = wt_lib.worktree_state(worktree, base)
+    # Not running inside a hook here, so measure properly rather than settling
+    # for the short report-sized limit the inventory uses.
+    state = wt_lib.worktree_state(worktree, base, timeout=wt_lib.GIT_SCAN_TIMEOUT)
     hits = [path for _, path in files if protected and match_protected(path, protected)]
 
     print(f"Worktree:  {worktree}")
@@ -552,11 +666,17 @@ def main() -> int:
     # Commit first: whatever happens afterwards, the work is safe in git.
     if files:
         message = args.message or f"wt({branch}): work in progress"
-        code, _, err = wt_lib.run_git(["add", "-A"], worktree)
+        # add -A hashes every changed file and commit runs the repo's hooks;
+        # both scale with the change set, not with the ref graph.
+        code, _, err = wt_lib.run_git(
+            ["add", "-A"], worktree, timeout=wt_lib.GIT_SCAN_TIMEOUT
+        )
         if code != 0:
             print(f"ERROR: git add failed: {err}")
             return 1
-        code, out, err = wt_lib.run_git(["commit", "-m", message], worktree)
+        code, out, err = wt_lib.run_git(
+            ["commit", "-m", message], worktree, timeout=wt_lib.GIT_SCAN_TIMEOUT
+        )
         if code != 0:
             print(f"ERROR: git commit failed: {err or out}")
             return 1
@@ -601,7 +721,9 @@ def main() -> int:
 
     print()
     code, out, err = wt_lib.run_git(
-        ["push", "-u", remote, f"HEAD:{branch}"], worktree
+        ["push", "-u", remote, f"HEAD:{branch}"],
+        worktree,
+        timeout=wt_lib.GIT_NETWORK_TIMEOUT,
     )
     if code != 0:
         print(f"ERROR: push failed: {err or out}")

@@ -36,6 +36,73 @@ import subprocess
 import time
 from pathlib import Path
 
+# ---------------------------------------------------------------------------
+# git timeouts
+# ---------------------------------------------------------------------------
+# One number cannot serve every git command, because the COST OF OVERRUNNING
+# differs by orders of magnitude between them. A killed `rev-parse` costs a
+# line of the report; a killed `merge` can leave a working tree half-rewritten.
+# So the commands are grouped by what they touch.
+#
+# The old single default of 15 seconds was calibrated on queries alone and bit
+# twice in production: once killing `git worktree add` mid-checkout, and once
+# killing `git merge` AFTER it had already written the merge commit, which was
+# then reported to the user as "MERGE FAILED".
+#
+# The values below are MEASURED, not guessed, against the documentation
+# repository these scripts were built in -- 53,036 tracked files / 3.41 GB on
+# Windows, which is the largest tree this workflow is known to meet:
+#
+#     git status (whole tree)              0.24 s
+#     git diff --name-only (1,651 files)   0.05 s
+#     materialise 1,650 files / 802 MB     6.0 s     <- a big merge
+#     materialise all 53,036 files         ~194 s    <- git worktree add
+#
+# Throughput is bounded by FILE COUNT (~273 files/s), not by byte volume: the
+# same 3.41 GB in few large files would take about 26 s. So a repository with
+# many small files is the case to size for.
+#
+# Two rules when adjusting these. A timeout exists to stop a HANG, not to
+# express impatience -- any value a healthy command can plausibly reach is too
+# low. But an overrun is no longer catastrophic either: since wt_finish.py
+# stopped treating a timeout as a verdict and started asking the repository
+# what actually happened, the worst outcome is one rerun. That is what keeps
+# these ceilings in the minutes rather than the tens of minutes.
+
+# Metadata only -- reads refs, config and the index. Measured at 0.04-0.15 s
+# regardless of tree size; the headroom is for a contended index lock.
+GIT_QUERY_TIMEOUT = 60
+
+# Walks the working tree: status, diff --name-only, add. Measured at 0.24 s on
+# 53k files, so this is ~500x margin -- enough for a cold cache and an
+# on-access virus scanner, both of which multiply the figure, not double it.
+GIT_SCAN_TIMEOUT = 120
+
+# REWRITES the working tree: checkout, merge, worktree add/remove. Still the
+# tightest margin of the five: a full-tree checkout measured ~194 s, so this is
+# ~3x the worst real case -- enough to absorb a cold cache or an on-access virus
+# scanner, both of which multiply that figure rather than double it. It is the
+# one number to raise first if a larger repository ever appears, and the symptom
+# will be /done reporting that it could not tell what the merge did.
+GIT_WRITE_TIMEOUT = 600
+
+# Talks to the remote. Bounded by the network rather than the tree, and safe to
+# kill: a dead push leaves nothing behind locally.
+GIT_NETWORK_TIMEOUT = 300
+
+# The inventory rendered inside a SessionStart hook. Short ON PURPOSE, and the
+# one place where a low limit is right: Claude Code caps hook runtime, so a
+# measurement that outlives the hook is worse than an honest "could not
+# measure". Callers outside a hook (/done, /wt-list) pass GIT_SCAN_TIMEOUT.
+# Kept comfortably under the SessionStart hook budget in install.py, which the
+# inventory has to fit into SEVERAL of these calls, not one.
+GIT_REPORT_TIMEOUT = 30
+
+# Prefix of the stderr line run_git synthesises on a timeout. Callers match on
+# it to tell "git was killed" apart from "git said no", which are different
+# situations with different recoveries.
+TIMEOUT_MARKER = "git timed out after"
+
 # A lock untouched for longer than this is reported as "idle" -- the tab is
 # likely closed. Deliberately generous: a session you simply have not typed
 # into for a while must not be mistaken for an abandoned one. Overridable per
@@ -65,7 +132,7 @@ PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 
 
 def run_git(
-    args: list[str], cwd: str | Path, timeout: float = 15
+    args: list[str], cwd: str | Path, timeout: float = GIT_QUERY_TIMEOUT
 ) -> tuple[int, str, str]:
     """Run a git command and return (returncode, stdout, stderr), all trimmed.
 
@@ -73,16 +140,15 @@ def run_git(
     "this piece of information is unavailable" rather than as a crash, because
     the hooks must stay silent in non-git directories.
 
-    The 15-second default suits the queries this module is full of (status,
-    rev-list, worktree list). It is far too short for commands that populate a
-    working tree: `git worktree add` on a large repository takes minutes on
-    Windows, and a timeout there kills git midway, leaving a worktree still
-    carrying git's own `initializing` lock. Such callers must pass their own
-    timeout -- see wt_create.py.
+    The default covers metadata queries only. Any command that walks, rewrites
+    or transmits the tree must pass the matching constant from the block above
+    -- GIT_SCAN_TIMEOUT, GIT_WRITE_TIMEOUT or GIT_NETWORK_TIMEOUT -- because the
+    default is far too short for those and a kill there does real damage.
 
-    A timeout is reported distinctly from other failures. Both used to collapse
-    into one opaque "git invocation failed", which sent a real diagnosis down
-    the wrong path entirely.
+    A timeout is reported distinctly from other failures, and prefixed with
+    TIMEOUT_MARKER so callers can branch on it. Both used to collapse into one
+    opaque "git invocation failed", which sent a real diagnosis down the wrong
+    path entirely.
     """
     try:
         proc = subprocess.run(
@@ -98,12 +164,24 @@ def run_git(
         return (
             1,
             "",
-            f"git timed out after {timeout:g}s: git {' '.join(args[:2])} "
+            f"{TIMEOUT_MARKER} {timeout:g}s: git {' '.join(args[:2])} "
             f"(the command was killed midway)",
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return 1, "", f"git could not be started: {exc}"
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+
+def timed_out(stderr: str) -> bool:
+    """Did this failure come from our own timeout rather than from git?
+
+    The distinction matters most after a tree-rewriting command. git's own
+    error means git decided not to proceed and left a defined state behind. A
+    timeout means we killed it at an unknown point, so the exit code carries no
+    information about what was or was not done -- the repository has to be
+    asked instead.
+    """
+    return TIMEOUT_MARKER in (stderr or "")
 
 
 def find_main_checkout(cwd: str | Path) -> Path | None:
@@ -185,7 +263,9 @@ def resolve_base_ref(main: Path, config: dict) -> str:
     return "HEAD"
 
 
-def worktree_state(path: Path, base: str) -> dict:
+def worktree_state(
+    path: Path, base: str, timeout: float = GIT_REPORT_TIMEOUT
+) -> dict:
     """Summarise how much unsaved work a worktree holds.
 
     Three independent quantities, because they have different consequences:
@@ -194,6 +274,15 @@ def worktree_state(path: Path, base: str) -> dict:
       unpushed -- commits not yet on the branch's upstream; what /done pushes
 
     `empty` is the only state safe to clean up without asking: nothing to lose.
+
+    `timeout` defaults to the hook-sized limit because the commonest caller is
+    the SessionStart inventory, which must finish inside the hook's own budget.
+    Callers with time to spare (/done, /wt-list) pass GIT_SCAN_TIMEOUT.
+
+    Both probes must SUCCEED for `measured` to be set. A status that timed out
+    would otherwise leave dirty=0 and ahead=0 behind, and those two zeros are
+    exactly the pattern the renderer prints as "nothing to lose" -- a failed
+    measurement must never be able to produce the reassuring answer.
     """
     state: dict = {
         "exists": path.is_dir(),
@@ -206,23 +295,32 @@ def worktree_state(path: Path, base: str) -> dict:
         # explicitly rather than default into the reassuring answer.
         "empty": False,
         "measured": False,
+        "problem": "",
     }
     if not state["exists"]:
         # Directory gone, git metadata left behind. The BRANCH may still hold
         # commits, so this is emphatically not "nothing to lose" -- a real
         # f1-anchors worktree in this repo was reported exactly that way.
+        state["problem"] = "directory missing"
         return state
 
-    code, out, _ = run_git(["status", "--porcelain"], path)
-    if code == 0:
-        state["dirty"] = len([ln for ln in out.splitlines() if ln.strip()])
+    code, out, err = run_git(["status", "--porcelain"], path, timeout=timeout)
+    if code != 0:
+        state["problem"] = err or "git status failed"
+        return state
+    state["dirty"] = len([ln for ln in out.splitlines() if ln.strip()])
 
-    code, out, _ = run_git(["rev-list", "--count", f"{base}..HEAD"], path)
-    if code == 0 and out.isdigit():
-        state["ahead"] = int(out)
+    code, out, err = run_git(
+        ["rev-list", "--count", f"{base}..HEAD"], path, timeout=timeout
+    )
+    if code != 0 or not out.isdigit():
+        state["problem"] = err or f"cannot count commits against {base}"
+        return state
+    state["ahead"] = int(out)
 
-    # An upstream may legitimately not exist yet (branch never pushed).
-    code, out, _ = run_git(["rev-list", "--count", "@{u}..HEAD"], path)
+    # An upstream may legitimately not exist yet (branch never pushed), so this
+    # probe is allowed to fail without spoiling the measurement.
+    code, out, _ = run_git(["rev-list", "--count", "@{u}..HEAD"], path, timeout=timeout)
     if code == 0 and out.isdigit():
         state["has_upstream"] = True
         state["unpushed"] = int(out)
@@ -590,10 +688,19 @@ def format_inventory(inventory: dict, include_current: bool = False) -> str:
         if not row.get("measured"):
             # Never claim safety about a worktree we could not inspect. The
             # branch can still carry commits even when the directory is gone.
-            bits.append(
-                "DIRECTORY MISSING - git metadata only; the branch may still "
-                "hold commits, so inspect it before removing anything"
-            )
+            # Two different unmeasured states, and conflating them would be a
+            # lie in one direction or the other: a missing directory is a fact
+            # about the worktree, a timed-out probe is a fact about us.
+            if row.get("exists"):
+                bits.append(
+                    f"COULD NOT MEASURE ({row.get('problem') or 'unknown reason'}) "
+                    "- state unknown, inspect it before removing anything"
+                )
+            else:
+                bits.append(
+                    "DIRECTORY MISSING - git metadata only; the branch may still "
+                    "hold commits, so inspect it before removing anything"
+                )
         else:
             if row["dirty"]:
                 bits.append(f"{row['dirty']} uncommitted")

@@ -38,10 +38,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import wt_lib  # noqa: E402
 
 
-# Populating a working tree is not a query. On this machine's documentation
-# repository the tracked tree is ~3.4 GB across 51k files, which took well over
-# the 15-second default and left a worktree locked mid-initialisation.
-WORKTREE_ADD_TIMEOUT = 300
+# Populating a working tree is not a query: on this machine's documentation
+# repository, writing out all 53k tracked files measures ~194 s. This is the
+# most expensive command in the package, and the one GIT_WRITE_TIMEOUT is
+# actually sized against. Kept as an alias rather than its own number so that
+# every tree-rewriting command -- add, checkout, merge, remove -- moves together
+# when the limit is tuned.
+WORKTREE_ADD_TIMEOUT = wt_lib.GIT_WRITE_TIMEOUT
 
 
 def estimate_tree_size(main: Path) -> float:
@@ -50,13 +53,13 @@ def estimate_tree_size(main: Path) -> float:
     Used only to set the user's expectations before a long wait, so a fast
     approximation from git's index beats walking the filesystem.
     """
-    code, out, _ = wt_lib.run_git(["ls-files", "-s"], main, timeout=60)
+    code, out, _ = wt_lib.run_git(["ls-files", "-s"], main, timeout=wt_lib.GIT_QUERY_TIMEOUT)
     if code != 0 or not out:
         return 0.0
     # Counting entries is enough for an order-of-magnitude hint; stat'ing 50k
     # files here would itself take longer than the message is worth.
     entries = out.count("\n") + 1
-    code, cat_out, _ = wt_lib.run_git(["count-objects", "-v"], main, timeout=60)
+    code, cat_out, _ = wt_lib.run_git(["count-objects", "-v"], main, timeout=wt_lib.GIT_QUERY_TIMEOUT)
     for line in cat_out.splitlines():
         if line.startswith("size-pack:"):
             try:
@@ -233,8 +236,9 @@ def main() -> int:
             print("'initializing' lock on the half-built worktree. Clear it with:")
             print(f"  git worktree unlock {worktree}")
             print(f"  git worktree remove --force {worktree}")
-            print("Then rerun. If it times out again, raise WORKTREE_ADD_TIMEOUT")
-            print(f"in {Path(__file__).name}.")
+            print("Then rerun. If it times out again, raise GIT_WRITE_TIMEOUT")
+            print(f"in wt_lib.py -- the current limit is "
+                  f"{WORKTREE_ADD_TIMEOUT // 60} minutes.")
         return 1
     print(f"Worktree checked out in {elapsed:.0f}s.")
 

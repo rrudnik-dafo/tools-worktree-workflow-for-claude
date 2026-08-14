@@ -20,6 +20,8 @@ Checks:
   4. the handover is named per-branch, so two finishing sessions cannot collide
   5. --merge merges, removes the worktree, deletes the branch, clears handover
   6. a failing gate stops before merging, leaving the commit intact
+  7. a timeout is distinguishable from a git error, and the post-merge state
+     is read from the repository rather than inferred from an exit code
 """
 import json
 import os
@@ -218,6 +220,26 @@ def main() -> int:
           f"{commits(wt2)} vs {before_gate + 1}")
     check("no handover written", not handovers())
     check("main untouched", "again" not in (repo / "README.md").read_text(encoding="utf-8"))
+
+    print("\n7. a timeout is not a verdict")
+    # The defect this guards against: `git merge` was killed by our own 15s
+    # limit AFTER it had written the merge commit, and the non-zero exit code
+    # was reported to the user as "MERGE FAILED" while the merge sat in the
+    # history. The fix is that a timeout sends us to ask the repository what
+    # actually happened, so these are the three questions it asks.
+    import wt_finish  # noqa: PLC0415 -- only this section needs it
+
+    _, _, err = wt_lib.run_git(["status", "--porcelain"], repo, timeout=0.001)
+    check("a real timeout is recognised as one", wt_lib.timed_out(err), err)
+    check("an ordinary git error is not",
+          not wt_lib.timed_out("fatal: not a git repository"))
+    check("no merge in progress on a clean repo",
+          not wt_finish.merge_in_progress(repo))
+    # worktree-second was never merged; worktree-feature was, in step 5.
+    check("containment: an unmerged branch reads as unmerged",
+          not wt_finish.branch_is_merged(repo, "worktree-second", "main"))
+    check("containment: a merged branch reads as merged",
+          wt_finish.branch_is_merged(repo, "HEAD~1", "main"))
 
     git(["worktree", "remove", "--force", str(wt2)], repo)
     for leftover in LOCK_ROOT.glob("repo-*"):

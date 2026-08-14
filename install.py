@@ -47,8 +47,15 @@ POLICY_END = "<!-- wt-policy:end -->"
 POLICY_HEADING = "## Worktree sessions (policy)"
 
 # event name -> (hook script argument, timeout seconds, async)
+#
+# SessionStart is the only one that runs git against the working tree, and it
+# must outlast wt_lib.GIT_REPORT_TIMEOUT with room for several calls -- a hook
+# killed halfway produces no inventory at all. It normally finishes in well
+# under a second; this budget only comes into play on a cold cache over a
+# multi-GB tree. The heartbeats just rewrite a small JSON file and are async,
+# so they stay tight.
 HOOK_EVENTS = {
-    "SessionStart": ("session-start", 30, False),
+    "SessionStart": ("session-start", 60, False),
     "UserPromptSubmit": ("heartbeat", 15, True),
     "Stop": ("heartbeat", 15, True),
     "SessionEnd": ("session-end", 15, False),

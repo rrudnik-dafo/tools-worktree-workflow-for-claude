@@ -280,10 +280,40 @@ the related upstream problem). This package therefore creates worktrees itself
 and passes git's own spelling of the path. A side effect: `ExitWorktree` will not
 remove such a worktree — which is intended, since `/done` owns removal.
 
-**Large repositories need patience on `/wt`.** Checking out a multi-gigabyte
-tree takes minutes; the timeout is 300 seconds (`WORKTREE_ADD_TIMEOUT` in
-`wt_create.py`). If it is exceeded, git is killed mid-initialisation and leaves
-the worktree holding its own lock:
+**Large repositories need patience, and the timeouts are sized for them.**
+Every git call this package makes has an explicit limit, chosen by what the
+command touches rather than by one global number. They live in one block at the
+top of `wt_lib.py`:
+
+| Constant | Limit | Covers | Measured cost |
+|---|---|---|---|
+| `GIT_QUERY_TIMEOUT` | 60 s | metadata — `rev-parse`, `worktree list`, `config` | 0.04–0.15 s |
+| `GIT_SCAN_TIMEOUT` | 2 min | walks the tree — `status`, `diff`, `add` | 0.24 s |
+| `GIT_WRITE_TIMEOUT` | 10 min | rewrites the tree — `checkout`, `merge`, `worktree add/remove` | 6 s / **194 s** |
+| `GIT_NETWORK_TIMEOUT` | 5 min | talks to the remote — `push`, `ls-remote` | link-dependent |
+| `GIT_REPORT_TIMEOUT` | 30 s | the inventory, which must fit inside a hook's budget | 0.24 s |
+
+The measurements come from a 53,036-file / 3.41 GB repository on Windows — the
+largest this workflow is known to meet. Only the write class is anywhere near
+its limit: materialising a big merge (1,650 files) takes ~6 s, but the full tree
+`git worktree add` writes takes ~194 s. Throughput is bounded by **file count**
+(~273 files/s), not byte volume — the same 3.41 GB in a few large files would
+take about 26 s — so a repository of many small files is the case to size for.
+
+A timeout exists to stop a hang, not to express impatience: any limit a healthy
+command can plausibly reach is too low. `GIT_WRITE_TIMEOUT` is the one to raise
+first if a larger repository appears; the others carry 100× margin or more.
+
+**A timeout is never treated as a verdict.** When a merge does not return in
+time, git was killed at an unknown point and its exit code says nothing about
+what was done. `/done` therefore asks the repository instead — is `MERGE_HEAD`
+present, and is the branch already contained in the base? — and reports one of
+three outcomes: the merge completed anyway (cleanup continues), a merge is
+half-applied (it stops and hands you the three recovery commands, rather than
+aborting on your behalf), or nothing was merged.
+
+If `/wt` is nonetheless killed mid-initialisation, the worktree is left holding
+git's own lock:
 
 ```bash
 git worktree unlock <path>
@@ -316,6 +346,16 @@ commit or stash there, then rerun.
 
 **Several sessions are waiting to merge.** The handover is per-branch, so
 `/done --merge` asks which one you mean; pass `--branch <name>`.
+
+**`/done` reported "MERGE FAILED" but the merge is in `git log`.** Fixed — this
+was the 15-second default killing git after it had already committed. Update the
+package (`git pull` in `~/.claude/scripts/wt/`, then rerun `install.py`) and the
+timeout path now checks the repository before reporting anything.
+
+**A worktree shows `COULD NOT MEASURE`.** `git status` or `rev-list` did not
+answer within the report timeout, so its state is genuinely unknown. It is not a
+claim that anything is wrong — but do not remove it on that reading; run
+`/wt-list` again, or check the worktree by hand.
 
 **`git worktree list` shows a worktree marked `prunable`.** Its directory is
 gone but git's metadata remains. `git worktree prune` clears the metadata and
