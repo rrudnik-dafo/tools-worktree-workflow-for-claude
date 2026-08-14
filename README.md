@@ -3,8 +3,6 @@
 Keep several Claude Code tabs open on one repository without them overwriting
 each other's work — and finish each piece of work with one command.
 
-> Ukrainian version with additional implementation notes: [README-uk.md](README-uk.md)
-
 ## What it is
 
 Claude Code lets you open many conversations at once. They all edit the **same
@@ -292,7 +290,52 @@ git worktree unlock <path>
 git worktree remove --force <path>
 ```
 
+## Troubleshooting
+
+**MCP servers disappeared inside the worktree.** Their configuration file is
+gitignored, so a fresh worktree never received it. Add it to
+`.worktreeinclude` — the file is copied at creation time, so the worktree has to
+be recreated for it to arrive.
+
+**"Blocked: command targets the main checkout".** Not a fault: while a session
+is isolated, Claude Code refuses writes, working directories and git redirects
+aimed at the main checkout. Merging is done from the main checkout, which is why
+`/done` leaves the worktree before it merges. Do not try to work around it.
+
+**`/done` says the session is in the MAIN checkout.** No worktree was entered,
+or `EnterWorktree` did not take effect. Check with `/wt-list`, which reports
+where the session actually is.
+
+**The gate failed.** The work is committed, the worktree is intact, nothing was
+merged. Fix the cause and run `/done` again. `--skip-gate` exists but is a
+deliberate human decision, not a way past a red check.
+
+**`/done` refuses because files collide.** A file arriving with the merge is
+also uncommitted in the main checkout. That is a guaranteed loss, not a risk —
+commit or stash there, then rerun.
+
+**Several sessions are waiting to merge.** The handover is per-branch, so
+`/done --merge` asks which one you mean; pass `--branch <name>`.
+
+**`git worktree list` shows a worktree marked `prunable`.** Its directory is
+gone but git's metadata remains. `git worktree prune` clears the metadata and
+touches nothing else; the branch survives.
+
 ## Development
+
+Package layout:
+
+```
+install.py         install for this machine, and --init-repo for a repository
+policy.md          behaviour rules, injected into ~/.claude/CLAUDE.md
+commands/          source of the slash commands (wt, done, wt-list)
+wt_lib.py          core: git plumbing, session locks, worktree inventory
+wt_hook.py         all lifecycle hooks, one entry point
+wt_create.py       worktree creation (/wt)
+wt_status.py       inventory report (/wt-list)
+wt_finish.py       the two-phase finish (/done)
+test_workflow.py   end-to-end rehearsal in a throwaway repository
+```
 
 After changing `wt_finish.py` or `wt_lib.py`, run the rehearsal:
 
