@@ -280,14 +280,20 @@ workflow просто мовчки не працюватиме. Тому шля�
 
 **Два кроки:**
 
-1. Скопіювати теку `~/.claude/scripts/wt/` на новий ПК у те саме місце
-   (`C:\Users\<ім'я>\.claude\scripts\wt\`). Це самодостатній пакет: скрипти,
-   `commands/`, `policy.md`, `install.py`, цей README.
+1. Склонувати пакет у те саме місце (`C:\Users\<ім'я>\.claude\scripts\wt\`):
+
+   ```bash
+   git clone https://github.com/rrudnik-dafo/tools-worktree-workflow-for-claude.git ~/.claude/scripts/wt
+   ```
+
 2. Виконати:
 
    ```bash
    ~/.local/bin/uv run --no-project ~/.claude/scripts/wt/install.py
    ```
+
+Оновлення потім — `git -C ~/.claude/scripts/wt pull`, і повторний
+`install.py`, якщо змінилися `policy.md`, `commands/` або перелік хуків.
 
 Інсталятор сам:
 
