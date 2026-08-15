@@ -443,6 +443,21 @@ def merge_phase(args) -> int:
                 print(" brought in by .worktreeinclude, which still exist in the")
                 print(" main checkout. Say so now if any of them was hand-made.)")
 
+            # The OTHER reason git refuses, and the one that hits every single
+            # run: Claude Code's EnterWorktree LOCKS the worktree ("locked
+            # claude session <name> (pid N)") and ExitWorktree keeps that lock
+            # -- correctly, since /done has to leave with `keep` (a `remove`
+            # there would delete the branch while the work is still unmerged).
+            # A single --force does not override a lock; git wants `-f -f` or an
+            # explicit unlock. Unlock is the better half of that choice: it
+            # clears exactly the obstacle we put there ourselves, and leaves a
+            # second --force to mean what it always meant. A worktree with no
+            # lock makes this a harmless no-op, so it is unconditional.
+            wt_lib.run_git(
+                ["worktree", "unlock", str(worktree)],
+                main_checkout,
+                timeout=wt_lib.GIT_QUERY_TIMEOUT,
+            )
             code, _, err2 = wt_lib.run_git(
                 ["worktree", "remove", "--force", str(worktree)],
                 main_checkout,
@@ -450,7 +465,8 @@ def merge_phase(args) -> int:
             )
             if code != 0:
                 print(f"WARNING: could not remove the worktree: {err2 or err}")
-                print(f"         Remove it manually: git worktree remove --force {worktree}")
+                print(f"         Remove it manually: git worktree unlock {worktree}")
+                print(f"                       then: git worktree remove --force {worktree}")
             else:
                 print(f"Removed worktree (forced): {worktree}")
         else:

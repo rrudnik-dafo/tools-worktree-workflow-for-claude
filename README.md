@@ -320,6 +320,18 @@ git worktree unlock <path>
 git worktree remove --force <path>
 ```
 
+**`/done` unlocks before removing, and has to.** Claude Code's `EnterWorktree`
+locks the worktree for the whole session, and `ExitWorktree` keeps that lock —
+correctly, since `/done` must leave with `keep`: a `remove` at that point would
+delete the branch while the work is still unmerged. So the cleanup step always
+meets a locked worktree, and a single `--force` is not enough for one (it
+overrides a *dirty* worktree; git wants `-f -f` or an unlock for a *locked*
+one). `/done` therefore unlocks first. Until 2026-08-15 it did not, and every
+run ended by printing a manual `git worktree remove` for the user to paste. The
+rehearsal missed it because `wt_create.py` does not lock, so its worktrees were
+never in the state a real session produces; `test_workflow.py` now locks the
+worktree before the `--merge` step.
+
 ## Troubleshooting
 
 **MCP servers disappeared inside the worktree.** Their configuration file is

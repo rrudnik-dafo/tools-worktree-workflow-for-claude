@@ -191,6 +191,15 @@ def main() -> int:
         check("named after the branch", "worktree-feature" in found[0].name, found[0].name)
 
     print("\n5. --merge from the main checkout")
+    # Lock the worktree first, the way Claude Code's EnterWorktree does for the
+    # whole life of a session. ExitWorktree keeps that lock (it has to: /done
+    # leaves with `keep`, because `remove` there would delete the branch while
+    # the work is still unmerged), so EVERY real run reaches this point locked --
+    # while the rehearsal, which creates its worktree through wt_create.py, never
+    # did. That gap is why a single `--force` shipped: it overrides a DIRTY
+    # worktree but not a LOCKED one, and git demands `-f -f` or an unlock. The
+    # "worktree removed" check below is the one that catches it.
+    git(["worktree", "lock", "--reason", "claude session feature (pid 1234)", str(wt)], repo)
     code, out = finish(["--merge"], repo)
     check("exits 0", code == 0, out)
     check("merge landed on main", "Merge worktree branch" in git(["log", "--oneline"], repo).stdout)
