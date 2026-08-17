@@ -16,7 +16,8 @@ four are not things to debug on real work.
 Checks:
   1. dry run changes nothing and announces the untracked stop
   2. --confirm refuses while an untracked file is present
-  3. --confirm proceeds once it is gone, and writes a handover
+  3. --confirm proceeds once it is gone, writes a handover, and survives a
+     non-ASCII commit message (the echo used to crash on a cp1252 console)
   4. the handover is named per-branch, so two finishing sessions cannot collide
   5. --merge merges, removes the worktree, deletes the branch, clears handover
   6. a failing gate stops before merging, leaving the commit intact
@@ -179,8 +180,15 @@ def main() -> int:
 
     print("\n3. --confirm once the stray file is gone")
     (wt / "scratch-notes.txt").unlink()
-    code, out = finish(["--confirm", "-m", "feat: add world"], wt)
+    # The commit message is deliberately NON-ASCII -- do not "tidy" it back. wt_finish echoes the
+    # message back, and on a cp1252 stdout (the Windows default, pipes included) that print raised
+    # UnicodeEncodeError. What made it expensive was WHERE: after `git commit` succeeded and before
+    # the gate, so the work was committed while the gate never ran and no handover was written,
+    # leaving the following --merge with nothing to read (2026-08-17). wt_lib makes the console
+    # UTF-8 tolerant on import; these two checks are what keep it that way.
+    code, out = finish(["--confirm", "-m", "feat: додає світ"], wt)
     check("exits 0", code == 0, out)
+    check("echoes a non-ASCII commit message without crashing", "додає" in out, out)
     check("committed", commits(wt) == baseline + 1, f"{commits(wt)} vs {baseline + 1}")
     check("tells the user to ExitWorktree next", "ExitWorktree" in out, out)
 

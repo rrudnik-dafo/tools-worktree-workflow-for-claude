@@ -22,8 +22,11 @@ Design notes
   lock refreshed recently means a live session; a stale lock means the tab is
   probably gone. SessionEnd deletes the lock outright when it fires, which
   turns the approximation into a certainty for that session.
-* All output is ASCII-only. Windows consoles default to cp1252 here and a
-  stray non-ASCII byte in hook output turns into an encoding crash.
+* All output written BY THIS PACKAGE is ASCII-only. Windows consoles default to
+  cp1252 here and a stray non-ASCII byte in hook output turns into an encoding
+  crash. That rule cannot cover echoed USER data (commit messages, branch names,
+  paths), so importing this module also makes the console UTF-8 tolerant -- see
+  _make_console_unicode_safe below.
 """
 
 from __future__ import annotations
@@ -33,8 +36,39 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# console encoding
+# ---------------------------------------------------------------------------
+def _make_console_unicode_safe() -> None:
+    """Stop an echo of user-supplied text from killing a run.
+
+    The ASCII-only rule above governs the strings this package writes; it says nothing about the ones
+    it repeats back. Every entry point prints user data at some point, and on Windows sys.stdout comes
+    up as cp1252, which cannot encode Cyrillic, CJK or plenty else.
+
+    Measured 2026-08-17: wt_finish.py --confirm with a Ukrainian commit message raised
+    UnicodeEncodeError from `print(f"Committed: {message}")`. The damage was not the traceback --
+    git had already committed successfully -- but WHERE it landed: after the commit and before the
+    gate, so the gate never ran and the handover file was never written, and the following --merge
+    had nothing to read. The work was committed and stranded.
+
+    utf-8 for terminals that understand it; errors="replace" so an old console degrades to '?'
+    rather than aborting mid-run. Called at import so no entry point can forget it, and guarded
+    because a captured or wrapped stdout need not offer reconfigure at all.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass          # already-wrapped or non-reconfigurable stream: leave it as it is
+
+
+_make_console_unicode_safe()
 
 # ---------------------------------------------------------------------------
 # git timeouts
