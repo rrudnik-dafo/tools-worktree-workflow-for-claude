@@ -177,6 +177,12 @@ def main() -> int:
         print("ERROR: not inside a git repository.")
         return 1
 
+    # Sweep first, and not merely out of tidiness: an empty leftover directory
+    # from an earlier /done makes the `worktree.is_dir()` check below answer
+    # "already exists, reusing it", so /wt would hand back a directory that is
+    # no longer a worktree at all and the session would work in a plain folder.
+    wt_lib.sweep_leftovers(main_checkout)
+
     # Creating a worktree from inside another worktree would branch off the
     # wrong tree and confuse the inventory; require the main checkout.
     inventory = wt_lib.collect_inventory(main_checkout, str(cwd))
@@ -197,11 +203,29 @@ def main() -> int:
     branch = f"worktree-{safe}"
 
     if worktree.is_dir():
-        # Reopening an existing worktree is a normal thing to want; say so
-        # plainly rather than failing.
-        print(f"Worktree already exists, reusing it: {worktree}")
-        print(git_spelling(main_checkout, worktree))
-        return 0
+        # "The directory exists" and "git knows it as a worktree" are different
+        # claims, and only the second one makes reuse safe. A leftover that the
+        # sweep above could not remove satisfies the first and fails the second;
+        # reusing it would drop the session into an ordinary folder with no
+        # branch and no isolation at all.
+        registered = any(
+            wt_lib.paths_equal(entry["path"], worktree)
+            for entry in wt_lib.list_worktrees(main_checkout)
+        )
+        if registered:
+            # Reopening an existing worktree is a normal thing to want; say so
+            # plainly rather than failing.
+            print(f"Worktree already exists, reusing it: {worktree}")
+            print(git_spelling(main_checkout, worktree))
+            return 0
+
+        print(f"ERROR: {worktree} exists on disk but git does not know it as a")
+        print("       worktree -- it is the empty shell left by an earlier /done")
+        print("       that a running process still holds open. It cannot be")
+        print("       reused and cannot be deleted while the holder lives.")
+        print("       Close the Claude Code tab that once worked in it, or pick")
+        print("       another name: /wt <other-name>")
+        return 1
 
     code, _, err = wt_lib.run_git(["rev-parse", "--verify", "--quiet", branch], main_checkout)
     branch_args = ["-B", branch] if code == 0 else ["-b", branch]

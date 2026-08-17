@@ -332,6 +332,42 @@ rehearsal missed it because `wt_create.py` does not lock, so its worktrees were
 never in the state a real session produces; `test_workflow.py` now locks the
 worktree before the `--merge` step.
 
+**The last empty directory outlives the removal, and cannot be helped on the
+spot.** Measured 2026-08-17: a `/done` merged, deleted the branch locally and on
+the remote, dropped git's admin entry and removed every file — and still left the
+worktree *directory* on disk. All three ways out were refused:
+
+```
+rmdir (Git Bash)    -> Device or resource busy
+Remove-Item (Win32) -> used by another process
+Rename-Item (Win32) -> used by another process
+```
+
+The holder is a live process whose **current working directory** is that
+directory — normally a Claude Code tab that once entered the worktree, because
+`EnterWorktree`/`ExitWorktree` move the session's directory while the OS-level
+cwd of the process never moves back. Windows will not delete *or rename* a
+directory that is any process's cwd.
+
+That last line is why the obvious design does not port. [Worktrunk](https://worktrunk.dev/remove/)
+renames the worktree into a trash directory (instant on the same filesystem) and
+lets a detached `rm -rf` finish afterwards; on Windows the rename is refused for
+exactly the same reason the delete is.
+
+So the leftover is **recorded and retried later**, from a session that is not the
+holder — every `SessionStart`, `/wt`, `/wt-list` and `/done` sweeps the list in
+`~/.claude/wt-locks/<repo>/sweep.json`. The rules:
+
+- only an **empty** directory is ever removed — a leftover with files in it means
+  removal failed long before the final `rmdir`, and is reported for a human
+  instead of being deleted unattended;
+- only paths under `<repo>/.claude/worktrees/` are touched at all;
+- `/wt` refuses to *reuse* a directory git does not know as a worktree, instead of
+  dropping the session into an ordinary folder with no branch and no isolation.
+
+Nothing needs doing about a `held` entry: closing the tab that once worked in
+that worktree releases it, and the next session removes it.
+
 ## Troubleshooting
 
 **MCP servers disappeared inside the worktree.** Their configuration file is
@@ -368,6 +404,12 @@ timeout path now checks the repository before reporting anything.
 answer within the report timeout, so its state is genuinely unknown. It is not a
 claim that anything is wrong — but do not remove it on that reading; run
 `/wt-list` again, or check the worktree by hand.
+
+**An empty worktree directory is still there after `/done`.** Expected, not a
+fault — a running process holds it as its working directory. It is on the sweep
+list and disappears by itself once that tab is closed; `/wt-list` shows it as
+`held`. Do **not** run `git worktree remove --force` on it: git has already
+dropped the admin entry, so that command answers *"is not a working tree"*.
 
 **`git worktree list` shows a worktree marked `prunable`.** Its directory is
 gone but git's metadata remains. `git worktree prune` clears the metadata and

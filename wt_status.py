@@ -27,6 +27,11 @@ def main() -> int:
         print("Not inside a git repository.")
         return 1
 
+    # Retry any leftover directory a previous /done could not remove. /wt-list
+    # is the natural place to SHOW the result rather than hide it: this command
+    # exists to answer "what is actually lying around".
+    swept = wt_lib.sweep_leftovers(main_checkout)
+
     inventory = wt_lib.collect_inventory(main_checkout, cwd)
     print(f"Repository:   {main_checkout}")
     print(f"Base ref:     {inventory['base']}")
@@ -50,6 +55,19 @@ def main() -> int:
         print(report)
     else:
         print("No worktrees. Every session is sharing the main checkout.")
+
+    if swept["removed"] or swept["held"] or swept["occupied"]:
+        print()
+        print("Leftover worktree directories:")
+        for path in swept["removed"]:
+            print(f"  swept    {path}")
+        for path in swept["held"]:
+            print(f"  held     {path}  (empty; a live process has it as its cwd)")
+        for path in swept["occupied"]:
+            print(f"  OCCUPIED {path}  (still has files -- not touched)")
+        if swept["held"]:
+            print("  'held' needs no action: it is retried every session and")
+            print("  clears itself once the holding tab is closed.")
 
     # Locks are shown separately because they answer a different question:
     # not "what work exists" but "who is still holding it".

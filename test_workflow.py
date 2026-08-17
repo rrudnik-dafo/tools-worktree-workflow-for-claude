@@ -23,6 +23,8 @@ Checks:
   6. a failing gate stops before merging, leaving the commit intact
   7. a timeout is distinguishable from a git error, and the post-merge state
      is read from the repository rather than inferred from an exit code
+  8. a worktree directory that outlives its removal is recorded and swept
+     later, never deleted recursively and never mistaken for a worktree
 """
 import json
 import os
@@ -257,6 +259,50 @@ def main() -> int:
           not wt_finish.branch_is_merged(repo, "worktree-second", "main"))
     check("containment: a merged branch reads as merged",
           wt_finish.branch_is_merged(repo, "HEAD~1", "main"))
+
+    print("\n8. leftover worktree directories are swept, not forgotten")
+    # The measured failure: /done merged, deleted the branch and dropped git's
+    # admin entry, yet the empty directory stayed on disk because a live process
+    # held it as its cwd. It cannot be removed from the finishing session, so it
+    # has to be recorded and retried later -- and never mistaken for a worktree.
+    ghost = repo / ".claude" / "worktrees" / "ghost"
+    ghost.mkdir(parents=True, exist_ok=True)
+    wt_lib.record_leftover(repo, ghost, "worktree-ghost")
+    check("leftover is recorded", len(wt_lib.read_sweep(repo)) == 1)
+
+    # An occupied leftover must be reported and LEFT ALONE -- the sweep is not
+    # an rm -rf, and files inside mean removal failed long before the rmdir.
+    (ghost / "stray.txt").write_text("x\n", encoding="utf-8", newline="\n")
+    swept = wt_lib.sweep_leftovers(repo)
+    check("occupied leftover is not deleted", (ghost / "stray.txt").is_file())
+    check("occupied leftover is reported", swept["occupied"] == [str(ghost)], swept)
+    check("occupied leftover stays on the list", len(wt_lib.read_sweep(repo)) == 1)
+
+    # Emptied, it is swept on the next attempt and the list clears itself.
+    (ghost / "stray.txt").unlink()
+    swept = wt_lib.sweep_leftovers(repo)
+    check("empty leftover is swept", not ghost.exists(), swept)
+    check("list clears itself once swept", wt_lib.read_sweep(repo) == [],
+          wt_lib.read_sweep(repo))
+
+    # Containment guard: a corrupted list must never aim the sweep elsewhere.
+    outsider = root / "not-in-the-repo"
+    outsider.mkdir(parents=True, exist_ok=True)
+    wt_lib.record_leftover(repo, outsider, "")
+    wt_lib.sweep_leftovers(repo)
+    check("sweep refuses paths outside .claude/worktrees", outsider.is_dir(),
+          "the sweep deleted a directory outside the repo's worktree dir")
+
+    # /wt must refuse a directory git does not know, rather than "reusing" it.
+    ghost.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        [UV, "run", "--no-project", str(PKG / "wt_create.py"), "ghost"],
+        cwd=str(repo), capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    ghost_out = proc.stdout + proc.stderr
+    check("/wt refuses an unregistered leftover directory", proc.returncode == 1, ghost_out)
+    check("/wt does not claim to reuse it", "reusing it" not in ghost_out, ghost_out)
+    shutil.rmtree(ghost, ignore_errors=True)
 
     git(["worktree", "remove", "--force", str(wt2)], repo)
     for leftover in LOCK_ROOT.glob("repo-*"):

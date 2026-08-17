@@ -552,6 +552,149 @@ def read_locks(main: Path) -> list[dict]:
     return locks
 
 
+# ---------------------------------------------------------------------------
+# deferred cleanup of leftover worktree directories
+# ---------------------------------------------------------------------------
+# Measured 2026-08-17, and the reason this section exists at all. A /done ran to
+# completion: the merge landed, the branch was deleted locally and on the remote,
+# git dropped the worktree's admin entry -- and every file inside the worktree
+# was gone. What survived was the EMPTY DIRECTORY, which refused to be removed:
+#
+#     rmdir (Git Bash)   -> Device or resource busy
+#     Remove-Item (Win32) -> used by another process
+#     Rename-Item (Win32) -> used by another process
+#
+# The last line is why worktrunk's design does not port. Its `wt remove` renames
+# the worktree into a trash directory (instant on the same filesystem) and lets a
+# detached rm -rf finish later; on Windows a held directory refuses the rename
+# exactly as it refuses the delete, so there is nothing to rename it to.
+#
+# The holder is a live process whose CURRENT WORKING DIRECTORY is that directory,
+# typically a Claude Code tab that once entered the worktree. EnterWorktree and
+# ExitWorktree move the session's logical directory; the OS-level CWD of the
+# process itself never moves back, and Windows will not delete or rename a
+# directory that is any process's CWD. Note what that rules out: the leftover
+# cannot be cleaned up by retrying harder INSIDE the finishing session, because
+# that session is a prime suspect for being the holder. It has to be tried again
+# later, from a session that is not holding it.
+#
+# Hence a written-down list and a sweep at every entry point. The safety rule is
+# deliberately narrow: the sweep removes an EMPTY directory and nothing else. A
+# leftover that still contains files means removal failed long before the final
+# rmdir, and that is a case for a human rather than for an automatic rm -rf
+# running unattended at session start.
+
+
+def sweep_file(main: Path) -> Path:
+    """Where leftovers are recorded, beside this repo's session locks."""
+    return locks_dir(main) / "sweep.json"
+
+
+def read_sweep(main: Path) -> list[dict]:
+    """Recorded leftovers for this repo: [{path, branch, recorded_at}]."""
+    path = sweep_file(main)
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict) and item.get("path")]
+
+
+def _write_sweep(main: Path, entries: list[dict]) -> None:
+    path = sweep_file(main)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if entries:
+            path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+        else:
+            # An empty list and a missing file mean the same thing; prefer the
+            # missing file so a clean repo leaves no bookkeeping behind.
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def record_leftover(main: Path, path: Path, branch: str = "") -> None:
+    """Note a worktree directory that outlived its removal, for a later sweep."""
+    entries = [e for e in read_sweep(main) if not paths_equal(e["path"], path)]
+    entries.append(
+        {"path": str(path), "branch": branch, "recorded_at": time.time()}
+    )
+    _write_sweep(main, entries)
+
+
+def directory_is_empty(path: Path) -> bool | None:
+    """True/False, or None when the directory cannot be listed at all."""
+    try:
+        next(path.iterdir())
+    except StopIteration:
+        return True
+    except OSError:
+        return None
+    return False
+
+
+def sweep_leftovers(main: Path) -> dict:
+    """Retry the recorded leftovers; return what happened.
+
+    {"removed": [str], "held": [str], "occupied": [str]}
+
+      removed  -- gone now (either we removed it or something else did)
+      held     -- still empty, still refused: the holder has not exited yet
+      occupied -- NOT empty, so deliberately left alone and kept on the list
+
+    Never raises and never removes anything recursively: at worst it is a no-op,
+    because it runs unattended from a SessionStart hook where a wrong guess would
+    be expensive and a missed sweep costs only one more attempt later.
+    """
+    result = {"removed": [], "held": [], "occupied": []}
+    entries = read_sweep(main)
+    if not entries:
+        return result
+
+    keep: list[dict] = []
+    for entry in entries:
+        path = Path(entry["path"])
+
+        # Containment guard: only ever touch something under this repository's
+        # worktree directory. A hand-edited or corrupted sweep list must not be
+        # able to point the sweep at an arbitrary path on the machine.
+        if not path_within(path, main / ".claude" / "worktrees"):
+            continue  # drop the entry rather than act on it
+
+        if not path.exists():
+            result["removed"].append(str(path))
+            continue
+
+        empty = directory_is_empty(path)
+        if empty is not True:
+            # Files inside, or unlistable. Either way this is not the tidy
+            # "empty shell" case, so report it and keep it for a human.
+            result["occupied"].append(str(path))
+            keep.append(entry)
+            continue
+
+        try:
+            path.rmdir()
+            result["removed"].append(str(path))
+        except OSError:
+            result["held"].append(str(path))
+            keep.append(entry)
+
+    _write_sweep(main, keep)
+
+    # A worktree whose directory has finally gone may still own an admin entry
+    # if it was removed by something other than git. Pruning is safe -- it only
+    # drops metadata for directories that no longer exist.
+    if result["removed"]:
+        run_git(["worktree", "prune"], main, timeout=GIT_QUERY_TIMEOUT)
+    return result
+
+
 def _slug_key(text: str | Path) -> str:
     """Collapse a path or directory name into a comparable key.
 

@@ -464,13 +464,46 @@ def merge_phase(args) -> int:
                 timeout=wt_lib.GIT_WRITE_TIMEOUT,
             )
             if code != 0:
-                print(f"WARNING: could not remove the worktree: {err2 or err}")
-                print(f"         Remove it manually: git worktree unlock {worktree}")
-                print(f"                       then: git worktree remove --force {worktree}")
+                print(f"WARNING: git could not remove the worktree: {err2 or err}")
             else:
                 print(f"Removed worktree (forced): {worktree}")
         else:
             print(f"Removed worktree: {worktree}")
+
+        # git's exit code answers "did the command succeed", which is not the
+        # question we care about. Ask the disk instead.
+        #
+        # Measured 2026-08-17: git reported success, deleted every file and
+        # dropped the admin entry -- and left the empty DIRECTORY behind, held
+        # by a live process whose current working directory it still was.
+        # Reporting that as a clean finish is precisely how a leftover goes
+        # unnoticed until the user trips over it days later, so the check runs on
+        # BOTH paths above, not only after a failure.
+        if worktree.exists():
+            empty = wt_lib.directory_is_empty(worktree)
+            wt_lib.record_leftover(main_checkout, worktree, branch)
+            print()
+            if empty is True:
+                # The tidy case: git finished, only the shell of the directory
+                # is left. Deliberately NOT advising `git worktree remove
+                # --force` here -- git has already dropped the admin entry, so
+                # that command now answers "is not a working tree" and sends the
+                # user off to delete it by hand.
+                print("NOTE: git finished, but the (now empty) directory is still there:")
+                print(f"        {worktree}")
+                print("      Windows will not delete a directory that is any")
+                print("      process's working directory. The usual holder is a")
+                print("      Claude Code tab that once entered this worktree --")
+                print("      ExitWorktree moves the session, not the OS-level cwd.")
+                print("      Nothing is lost: it is recorded and will be swept")
+                print("      automatically by a later session. To clear it now,")
+                print("      close that tab.")
+            else:
+                print("WARNING: the worktree directory still has FILES in it:")
+                print(f"        {worktree}")
+                print("      git did not get as far as emptying it, so this is not")
+                print("      the usual leftover. Nothing will be deleted")
+                print("      automatically -- inspect it before removing anything.")
 
         # Ask the question we actually care about: is every commit on this
         # branch now contained in the base branch? `git branch -d` asks a

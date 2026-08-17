@@ -55,6 +55,13 @@ def handle_session_start(data: dict) -> None:
     session_id = data.get("session_id", "")
     wt_lib.prune_locks(main)
 
+    # Sweep leftover worktree directories. This is the one moment that reliably
+    # works: a directory held by a finished session's process can only be
+    # removed once that process is gone, so the attempt has to come from a
+    # LATER session -- and every new session is one. Silent by design; a
+    # successful sweep is not news, and what it cannot remove is reported below.
+    swept = wt_lib.sweep_leftovers(main)
+
     # Whether to ask depends on WHY the session started. A resume or a context
     # compaction continues a session whose isolation decision was already
     # made; asking again would be noise. The field has gone by several names,
@@ -85,6 +92,25 @@ def handle_session_start(data: dict) -> None:
     inventory = wt_lib.collect_inventory(main, cwd)
     report = wt_lib.format_inventory(inventory)
 
+    # Only the failures are worth a line. `held` means the holding process is
+    # still alive, which is normal while its tab is open and needs no action
+    # from anyone; `occupied` means files are still in there, which does.
+    leftovers: list[str] = []
+    if swept["occupied"]:
+        leftovers += [
+            "",
+            f"{len(swept['occupied'])} leftover worktree director(ies) still",
+            "contain files. Nothing was deleted -- inspect before removing:",
+        ] + [f"  {path}" for path in swept["occupied"]]
+    if swept["held"]:
+        leftovers += [
+            "",
+            f"{len(swept['held'])} empty worktree director(ies) could not be",
+            "removed yet: a still-running process has one of them as its working",
+            "directory (usually a Claude Code tab that once entered it). They are",
+            "recorded and retried every session -- mention them, do not act:",
+        ] + [f"  {path}" for path in swept["held"]]
+
     # A session already inside a worktree has nothing to decide.
     if should_ask and inventory["current"] is None:
         others = [
@@ -114,6 +140,7 @@ def handle_session_start(data: dict) -> None:
             ask.insert(1, f"NOTE: {len(others)} other session(s) are live in this repo right now.")
         if report:
             ask += ["", "Existing worktrees:", report]
+        ask += leftovers
         emit(
             {
                 "hookSpecificOutput": {
@@ -124,7 +151,10 @@ def handle_session_start(data: dict) -> None:
         )
         return
 
-    if not report:
+    # A leftover is worth reporting even when there are no worktrees left to
+    # list -- that combination is in fact the commonest one, since the leftover
+    # is what a just-finished /done leaves behind.
+    if not report and not leftovers:
         return
 
     in_use = [w for w in inventory["worktrees"] if w["activity"] == "active"]
@@ -135,14 +165,18 @@ def handle_session_start(data: dict) -> None:
 
     # Two audiences, two messages. systemMessage is what the user reads in the
     # terminal; additionalContext is what Claude reads and must act on.
-    lines = [
-        "Open worktrees in this repository:",
-        report,
-        "",
-        "Status is inferred from two signals -- this workflow's own session",
-        "heartbeat, and the mtime of Claude Code's transcripts for that",
-        "directory. Neither is a list of open editor tabs, which does not exist.",
-    ]
+    lines = (
+        [
+            "Open worktrees in this repository:",
+            report,
+            "",
+            "Status is inferred from two signals -- this workflow's own session",
+            "heartbeat, and the mtime of Claude Code's transcripts for that",
+            "directory. Neither is a list of open editor tabs, which does not exist.",
+        ]
+        if report
+        else ["No open worktrees in this repository."]
+    )
     if in_use:
         lines += [
             "",
@@ -171,9 +205,13 @@ def handle_session_start(data: dict) -> None:
             "can be removed without losing anything -- still confirm before removing.",
         ]
 
+    lines += leftovers
+
     emit(
         {
-            "systemMessage": "Worktree inventory:\n" + report,
+            "systemMessage": "Worktree inventory:\n" + "\n".join(
+                ([report] if report else []) + leftovers
+            ).strip(),
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
                 "additionalContext": "\n".join(lines),
