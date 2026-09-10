@@ -96,6 +96,12 @@ def handle_session_start(data: dict) -> None:
     # still alive, which is normal while its tab is open and needs no action
     # from anyone; `occupied` means files are still in there, which does.
     leftovers: list[str] = []
+    if swept["unlocked"]:
+        leftovers += [
+            "",
+            f"Released {len(swept['unlocked'])} worktree lock(s) left by sessions",
+            "that are no longer running. They were blocking removal; no action needed:",
+        ] + [f"  {item['path']}" for item in swept["unlocked"]]
     if swept["occupied"]:
         leftovers += [
             "",

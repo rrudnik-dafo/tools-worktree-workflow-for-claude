@@ -146,6 +146,56 @@ def copy_included(main: Path, worktree: Path, patterns: list[str]) -> list[str]:
     return copied
 
 
+def reset_if_spent(main: Path, worktree: Path, branch: str, base: str) -> bool:
+    """Move a reused worktree back to `base` when its old work is finished.
+
+    Reopening a name is common, and until now it always handed back the branch
+    at its old tip. That is right while the work is unfinished and quietly wrong
+    once it is done: the next task starts on a stale branch that still carries
+    the previous one's commits, and they ride into the base branch a second time
+    at the next merge.
+
+    Three conditions, all required, because a reset --hard is not recoverable
+    from here -- the whole point is that there is nothing left to recover:
+      * nothing uncommitted and nothing untracked;
+      * still on the branch this workflow created for it;
+      * every commit it has is already contained in `base`.
+
+    Any doubt -- a git call that fails, a branch we do not recognise -- leaves
+    the worktree exactly as it was. Returns True only if the reset happened.
+    """
+    code, current, _ = wt_lib.run_git(["rev-parse", "--abbrev-ref", "HEAD"], worktree)
+    if code != 0 or current != branch:
+        return False
+
+    code, dirty, _ = wt_lib.run_git(
+        ["status", "--porcelain"], worktree, timeout=wt_lib.GIT_SCAN_TIMEOUT
+    )
+    if code != 0:
+        return False
+    if [line for line in dirty.splitlines() if line.strip()]:
+        print("  Keeping it at its current tip: it has uncommitted work.")
+        return False
+
+    # `merge-base --is-ancestor HEAD base` is the containment question, and the
+    # right one: it is satisfied both by a branch with no commits of its own and
+    # by one whose commits have already been merged.
+    code, _, _ = wt_lib.run_git(["merge-base", "--is-ancestor", "HEAD", base], worktree)
+    if code != 0:
+        print(f"  Keeping it at its current tip: it holds commits not yet in {base}.")
+        return False
+
+    code, _, err = wt_lib.run_git(
+        ["reset", "--hard", base], worktree, timeout=wt_lib.GIT_WRITE_TIMEOUT
+    )
+    if code != 0:
+        print(f"  WARNING: could not reset it to {base}: {err}")
+        return False
+    print(f"  Its previous work is already in {base}, so it was reset to {base}")
+    print("  -- a fresh start rather than a stale branch.")
+    return True
+
+
 def git_spelling(main: Path, worktree: Path) -> str:
     """The path exactly as git records it.
 
@@ -216,6 +266,7 @@ def main() -> int:
             # Reopening an existing worktree is a normal thing to want; say so
             # plainly rather than failing.
             print(f"Worktree already exists, reusing it: {worktree}")
+            reset_if_spent(main_checkout, worktree, branch, base)
             print(git_spelling(main_checkout, worktree))
             return 0
 

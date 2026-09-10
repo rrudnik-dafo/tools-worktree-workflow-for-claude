@@ -240,8 +240,13 @@ def find_main_checkout(cwd: str | Path) -> Path | None:
 def list_worktrees(main: Path) -> list[dict]:
     """Parse `git worktree list --porcelain` into dicts.
 
-    Each entry: {path: Path, branch: str|None, locked: bool, is_main: bool}.
+    Each entry: {path, branch, locked, lock_reason, is_main}.
     The first record git prints is always the main checkout.
+
+    The lock REASON is kept, not just the boolean: Claude Code stamps its own
+    locks with the owning process id, which is the only thing that tells a lock
+    held by a live session apart from one left behind by a session that died --
+    and those need opposite treatment. See release_dead_locks.
     """
     code, out, _ = run_git(["worktree", "list", "--porcelain"], main)
     if code != 0:
@@ -257,6 +262,7 @@ def list_worktrees(main: Path) -> list[dict]:
                 "path": Path(line[len("worktree ") :]),
                 "branch": None,
                 "locked": False,
+                "lock_reason": "",
             }
         elif current is None:
             continue
@@ -265,6 +271,8 @@ def list_worktrees(main: Path) -> list[dict]:
             current["branch"] = line[len("branch ") :].removeprefix("refs/heads/")
         elif line.startswith("locked"):
             current["locked"] = True
+            # Porcelain prints a bare "locked" or "locked <reason>".
+            current["lock_reason"] = line[len("locked") :].strip()
     if current:
         entries.append(current)
 
@@ -585,6 +593,83 @@ def read_locks(main: Path) -> list[dict]:
 # running unattended at session start.
 
 
+def process_alive(pid: int) -> bool | None:
+    """Is this process id still running? None when it cannot be determined.
+
+    Deliberately NOT os.kill(pid, 0). That idiom is correct on POSIX and
+    actively dangerous on Windows, where Python's os.kill ignores the signal for
+    anything but the two console events and calls TerminateProcess instead -- so
+    the "harmless liveness probe" would kill the process it asked about.
+
+    None is a real answer and not an error: the caller must treat "cannot tell"
+    as "assume alive", because the whole point of the check is to decide whether
+    to release someone else's lock.
+    """
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        import ctypes
+
+        # PROCESS_QUERY_LIMITED_INFORMATION: the least privilege that answers
+        # the question, and the one that works across integrity levels.
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        # ERROR_INVALID_PARAMETER (87) means no such process. Anything else --
+        # typically ERROR_ACCESS_DENIED (5) -- means it exists but is not ours
+        # to inspect, which is emphatically not "dead".
+        return False if kernel32.GetLastError() == 87 else None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except OSError:
+        return None
+    return True
+
+
+# Claude Code stamps the locks it takes with the owning process, in the shape
+# "claude session <name> (pid 12345)". Matching the pid is what makes it safe to
+# release: a lock we cannot attribute to a dead process is left alone.
+_LOCK_PID = re.compile(r"\bpid[\s:=]*(\d+)", re.IGNORECASE)
+
+
+def release_dead_locks(main: Path) -> list[dict]:
+    """Unlock worktrees whose locking process is gone. Returns what was freed.
+
+    A worktree locked by a session that never ran /done stays locked forever,
+    and a locked worktree refuses `git worktree remove` even with --force. That
+    turns one crashed tab into a worktree nobody can clean up.
+
+    Three conditions, all required, because unlocking someone else's worktree
+    while they are working in it is worse than leaving a stale lock:
+      * the lock names a pid  -- a hand-set `git worktree lock` usually gives a
+        prose reason or none at all, and must never be touched;
+      * that pid is certainly gone -- "cannot tell" counts as alive;
+      * the worktree is not the main checkout.
+    """
+    freed: list[dict] = []
+    for entry in list_worktrees(main):
+        if entry.get("is_main") or not entry.get("locked"):
+            continue
+        match = _LOCK_PID.search(entry.get("lock_reason") or "")
+        if not match:
+            continue  # not ours to judge
+        if process_alive(int(match.group(1))) is not False:
+            continue  # alive, or unknowable
+        code, _, _ = run_git(["worktree", "unlock", str(entry["path"])], main)
+        if code == 0:
+            freed.append(
+                {"path": str(entry["path"]), "reason": entry["lock_reason"]}
+            )
+    return freed
+
+
 def sweep_file(main: Path) -> Path:
     """Where leftovers are recorded, beside this repo's session locks."""
     return locks_dir(main) / "sweep.json"
@@ -641,17 +726,27 @@ def directory_is_empty(path: Path) -> bool | None:
 def sweep_leftovers(main: Path) -> dict:
     """Retry the recorded leftovers; return what happened.
 
-    {"removed": [str], "held": [str], "occupied": [str]}
+    {"removed": [str], "held": [str], "occupied": [str], "unlocked": [dict]}
 
       removed  -- gone now (either we removed it or something else did)
       held     -- still empty, still refused: the holder has not exited yet
       occupied -- NOT empty, so deliberately left alone and kept on the list
+      unlocked -- worktrees freed from a lock whose process is gone
+
+    The lock release rides along here rather than in its own pass because it
+    answers the same question at the same four call sites: what did an earlier
+    session leave behind that this one can safely clear up?
 
     Never raises and never removes anything recursively: at worst it is a no-op,
     because it runs unattended from a SessionStart hook where a wrong guess would
     be expensive and a missed sweep costs only one more attempt later.
     """
-    result = {"removed": [], "held": [], "occupied": []}
+    result = {
+        "removed": [],
+        "held": [],
+        "occupied": [],
+        "unlocked": release_dead_locks(main),
+    }
     entries = read_sweep(main)
     if not entries:
         return result

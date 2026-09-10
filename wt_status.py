@@ -56,6 +56,15 @@ def main() -> int:
     else:
         print("No worktrees. Every session is sharing the main checkout.")
 
+    if swept["unlocked"]:
+        print()
+        print("Released locks left by sessions that are gone:")
+        for item in swept["unlocked"]:
+            print(f"  {item['path']}")
+            print(f"    was: {item['reason']}")
+        print("  (a locked worktree refuses removal even with --force, so an")
+        print("   unreleased lock makes it uncleanable)")
+
     if swept["removed"] or swept["held"] or swept["occupied"]:
         print()
         print("Leftover worktree directories:")

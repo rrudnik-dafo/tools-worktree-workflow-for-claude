@@ -405,6 +405,41 @@ def merge_phase(args) -> int:
         return 2
     print((out + "\n" + err).strip() or f"Merged in {elapsed:.0f}s.")
 
+    # ---- the post-merge gate --------------------------------------------
+    # The ordinary gate runs in the WORKTREE, before the merge, so it tests the
+    # branch and not the result. That is a structural blind spot, not an
+    # oversight: two branches can each be green and still break the base branch
+    # together, because a semantic conflict leaves no textual conflict for git
+    # to report. This gate runs in the MAIN checkout on the merged tree, which
+    # is the only place that question can be asked.
+    #
+    # On failure: stop BEFORE removing anything. The merge is already in the
+    # base branch, and the branch plus worktree are what make it recoverable --
+    # deleting them here would leave a broken base and nothing to fix it from.
+    # The undo is offered as a command, never performed: reset --hard discards
+    # whatever else has landed since, and that judgement is the user's.
+    post_gate = list(config.get("postMergeGate", []))
+    if post_gate and not args.skip_gate:
+        print()
+        print(f"Running post-merge gate ({len(post_gate)} command(s)) on {base_local}...")
+        ok, log = run_gate(post_gate, main_checkout)
+        for line in log:
+            print(line)
+        if not ok:
+            print()
+            print(f"POST-MERGE GATE FAILED. {base_local} now holds the merge and")
+            print("it does not pass this repository's own checks.")
+            print()
+            print(f"Nothing was cleaned up: {branch} and its worktree are intact,")
+            print("so the fix can be made there and merged again.")
+            print("Two ways out, both yours to choose:")
+            print(f"  fix forward -- work in {worktree}, then rerun /done")
+            print(f"  undo        -- git reset --hard HEAD~1   (in {main_checkout})")
+            print("                 discards the merge AND anything merged after it")
+            return 2
+    elif post_gate and args.skip_gate:
+        print("Post-merge gate SKIPPED by explicit request.")
+
     if delete_worktree:
         print()
         # Removal deletes the whole checked-out tree -- several GB of small
@@ -682,9 +717,17 @@ def main() -> int:
         if mode == "merge":
             print(f"  {step}. leave the worktree (ExitWorktree)")
             print(f"  {step + 1}. git merge --no-ff {branch} into {base_local}")
-            print(f"  {step + 2}. remove the worktree and delete the branch")
+            step += 2
+            post_gate = list(config.get("postMergeGate", []))
+            if post_gate and not args.skip_gate:
+                print(f"  {step}. run the post-merge gate on {base_local}:")
+                for command in post_gate:
+                    print(f"       {command}")
+                print("       if it fails, stop here and keep the branch")
+                step += 1
+            print(f"  {step}. remove the worktree and delete the branch")
             if config.get("pushAfterMerge", False):
-                print(f"  {step + 3}. git push {remote} {base_local}")
+                print(f"  {step + 1}. git push {remote} {base_local}")
             else:
                 print(f"  (not pushing {base_local} -- pushAfterMerge is off)")
         else:

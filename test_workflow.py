@@ -25,6 +25,11 @@ Checks:
      is read from the repository rather than inferred from an exit code
   8. a worktree directory that outlives its removal is recorded and swept
      later, never deleted recursively and never mistaken for a worktree
+  9. a lock left by a dead session is released; a live or hand-set one is not
+ 10. a reused worktree is reset to base once its work is merged, and left
+     alone when it holds unmerged or uncommitted work
+ 11. the post-merge gate stops the cleanup and keeps the branch, so a merge
+     that breaks the base branch still has something to fix it from
 """
 import json
 import os
@@ -246,7 +251,8 @@ def main() -> int:
     # was reported to the user as "MERGE FAILED" while the merge sat in the
     # history. The fix is that a timeout sends us to ask the repository what
     # actually happened, so these are the three questions it asks.
-    import wt_finish  # noqa: PLC0415 -- only this section needs it
+    import wt_create  # noqa: PLC0415 -- sections 7-10 need these
+    import wt_finish  # noqa: PLC0415
 
     _, _, err = wt_lib.run_git(["status", "--porcelain"], repo, timeout=0.001)
     check("a real timeout is recognised as one", wt_lib.timed_out(err), err)
@@ -303,6 +309,104 @@ def main() -> int:
     check("/wt refuses an unregistered leftover directory", proc.returncode == 1, ghost_out)
     check("/wt does not claim to reuse it", "reusing it" not in ghost_out, ghost_out)
     shutil.rmtree(ghost, ignore_errors=True)
+
+    print("\n9. locks left by a dead session are released, live ones are not")
+    # A worktree locked by a session that never ran /done stays locked forever,
+    # and a locked worktree refuses `git worktree remove` even with --force --
+    # one crashed tab becomes a worktree nobody can clean up. The release is
+    # keyed on the pid git records in the lock reason, so the two cases that
+    # must NOT be touched are a live pid and a hand-written reason.
+    check("a dead pid reads as dead", wt_lib.process_alive(999_999_999) is False)
+    check("our own pid reads as alive", wt_lib.process_alive(os.getpid()) is True)
+
+    git(["worktree", "lock", "--reason", "claude session x (pid 999999999)", str(wt2)], repo)
+    freed = wt_lib.release_dead_locks(repo)
+    check("a lock from a dead session is released", len(freed) == 1, freed)
+    check("git agrees it is unlocked",
+          not [w for w in wt_lib.list_worktrees(repo)
+               if w.get("locked") and not w["is_main"]])
+
+    git(["worktree", "lock", "--reason", f"claude session x (pid {os.getpid()})", str(wt2)], repo)
+    check("a lock from a LIVE session is left alone", wt_lib.release_dead_locks(repo) == [])
+    git(["worktree", "lock", "--reason", "keep this, I am using it", str(wt2)], repo)
+    check("a hand-written lock reason is never touched",
+          wt_lib.release_dead_locks(repo) == [])
+    git(["worktree", "unlock", str(wt2)], repo)
+
+    print("\n10. a reused worktree is reset once its work is merged")
+    # Reopening a name used to hand back the old tip unconditionally, so the
+    # next task started on a branch still carrying the previous one's commits.
+    spent = repo / ".claude" / "worktrees" / "spent"
+    git(["worktree", "add", "-b", "worktree-spent", str(spent), "main"], repo)
+    (spent / "spent.txt").write_text("done\n", encoding="utf-8", newline="\n")
+    git(["add", "-A"], spent)
+    git(["commit", "-m", "work that will be merged"], spent)
+    git(["merge", "--no-ff", "worktree-spent", "-m", "merge spent"], repo)
+
+    before = git(["rev-parse", "HEAD"], spent).stdout.strip()
+    did = wt_create.reset_if_spent(repo, spent, "worktree-spent", "main")
+    check("merged work resets the worktree to base", did, "no reset happened")
+    check("it really moved", git(["rev-parse", "HEAD"], spent).stdout.strip() != before)
+
+    # Unmerged work must survive untouched -- this is a reset --hard, after all.
+    (spent / "unmerged.txt").write_text("keep\n", encoding="utf-8", newline="\n")
+    git(["add", "-A"], spent)
+    git(["commit", "-m", "not merged anywhere"], spent)
+    check("unmerged commits are left alone",
+          not wt_create.reset_if_spent(repo, spent, "worktree-spent", "main"))
+    check("the unmerged file survives", (spent / "unmerged.txt").is_file())
+
+    # So must uncommitted work.
+    git(["reset", "--hard", "main"], spent)
+    (spent / "dirty.txt").write_text("wip\n", encoding="utf-8", newline="\n")
+    check("a dirty worktree is left alone",
+          not wt_create.reset_if_spent(repo, spent, "worktree-spent", "main"))
+    check("the dirty file survives", (spent / "dirty.txt").is_file())
+    git(["worktree", "remove", "--force", str(spent)], repo)
+    git(["branch", "-D", "worktree-spent"], repo)
+
+    print("\n11. the post-merge gate guards the base branch, and keeps the way back")
+    # The ordinary gate runs in the worktree BEFORE the merge, so it can only
+    # ever test the branch. Two branches can each be green and still break the
+    # base together -- a semantic conflict leaves no textual conflict to report.
+    # When this gate fails the merge is already in, so the branch and worktree
+    # must survive: they are the only way to fix it.
+    (repo / ".claude" / "wt.json").write_text(
+        json.dumps({"finish": "merge", "gate": [], "postMergeGate": ["exit 7"]}, indent=2),
+        encoding="utf-8", newline="\n",
+    )
+    git(["add", "-A"], repo)
+    git(["commit", "-m", "add failing post-merge gate"], repo)
+
+    pg = repo / ".claude" / "worktrees" / "postgate"
+    git(["worktree", "add", "-b", "worktree-postgate", str(pg), "main"], repo)
+    # A tracked file, deliberately: an untracked one would trip the new-file
+    # stop from section 2 before this section's subject is even reached.
+    (pg / "README.md").write_text("hello\nworld\npostgate\n", encoding="utf-8", newline="\n")
+    code, out = finish(["--confirm", "-m", "feat: postgate"], pg)
+    check("phase 1 succeeds", code == 0, out)
+
+    code, out = finish(["--merge", "--branch", "worktree-postgate"], repo)
+    check("a failing post-merge gate exits 2", code == 2, out)
+    check("the merge itself did land",
+          "postgate" in (repo / "README.md").read_text(encoding="utf-8"),
+          "merge did not reach the base branch")
+    check("the worktree is KEPT so the fix can be made", pg.is_dir(), out)
+    check("the branch is KEPT", "worktree-postgate" in git(["branch"], repo).stdout)
+    check("it offers both ways out", "fix forward" in out and "reset --hard" in out, out)
+    check("the handover survives for the rerun", len(handovers()) == 1, handovers())
+
+    # Fixed: the same rerun now completes and cleans up.
+    (repo / ".claude" / "wt.json").write_text(
+        json.dumps({"finish": "merge", "gate": [], "postMergeGate": ["exit 0"]}, indent=2),
+        encoding="utf-8", newline="\n",
+    )
+    git(["add", "-A"], repo)
+    git(["commit", "-m", "fix the post-merge gate"], repo)
+    code, out = finish(["--merge", "--branch", "worktree-postgate"], repo)
+    check("the rerun completes once the gate passes", code == 0, out)
+    check("now the worktree is gone", not pg.exists(), out)
+    check("now the branch is gone", "worktree-postgate" not in git(["branch"], repo).stdout)
 
     git(["worktree", "remove", "--force", str(wt2)], repo)
     for leftover in LOCK_ROOT.glob("repo-*"):

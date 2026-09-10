@@ -368,6 +368,39 @@ holder — every `SessionStart`, `/wt`, `/wt-list` and `/done` sweeps the list i
 Nothing needs doing about a `held` entry: closing the tab that once worked in
 that worktree releases it, and the next session removes it.
 
+**Two gates, because they ask different questions.** `gate` runs in the
+worktree before the merge; `postMergeGate` runs in the main checkout after it.
+The first tests the *branch*, the second tests the *result* — and only the
+second can catch a semantic conflict, where two branches are each green and
+break the base branch together without git seeing a textual conflict.
+
+When the post-merge gate fails, `/done` stops **before** cleaning up. The merge
+is already in the base branch, so the branch and worktree are the only way back
+and are deliberately kept. It prints the undo command and never runs it: a
+`reset --hard` would also discard anything merged after, and that judgement is
+yours.
+
+Borrowed from [worktrunk](https://worktrunk.dev/merge/), which splits the same
+idea four ways (`pre-merge`, `pre-remove`, `post-merge`, `post-remove`) and calls
+it local CI.
+
+**Locks left by sessions that are gone are released.** Claude Code locks a
+worktree for the duration of a session, and a locked worktree refuses removal
+even with `--force` — so a tab that crashed before `/done` leaves a worktree
+nobody can clean up. The sweep releases such a lock only when git's recorded lock
+reason names a **process id** and that process is certainly gone. A lock you set
+yourself with `git worktree lock --reason "..."` names no pid and is never
+touched, and "cannot tell whether it is alive" counts as alive.
+
+**A reused worktree name starts fresh when its old work is finished.** Opening
+`/wt <name>` on an existing worktree used to hand back the branch at its old tip,
+so the next task began on a branch still carrying the previous one's commits —
+which then rode into the base branch a second time at the next merge. It is now
+reset to the base branch, but only when all three hold: nothing uncommitted,
+still on the branch this workflow created, and every commit already contained in
+the base. Any doubt keeps it exactly as it was. Same rule Claude Code applies
+natively when you [reuse a worktree name](https://code.claude.com/docs/en/worktrees).
+
 ## Troubleshooting
 
 **MCP servers disappeared inside the worktree.** Their configuration file is
