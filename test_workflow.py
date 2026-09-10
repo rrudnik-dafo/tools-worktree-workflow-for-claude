@@ -30,6 +30,8 @@ Checks:
      alone when it holds unmerged or uncommitted work
  11. the post-merge gate stops the cleanup and keeps the branch, so a merge
      that breaks the base branch still has something to fix it from
+ 12. the pre-commit file list reports every path in full, including the first
+     one, whose leading porcelain column a trim used to eat
 """
 import json
 import os
@@ -407,6 +409,33 @@ def main() -> int:
     check("the rerun completes once the gate passes", code == 0, out)
     check("now the worktree is gone", not pg.exists(), out)
     check("now the branch is gone", "worktree-postgate" not in git(["branch"], repo).stdout)
+
+    print("\n12. the file list names the file, character for character")
+    # The measured defect: run_git trimmed stdout, `git status --porcelain`
+    # marks an unstaged change with a LEADING space (" M path"), and the trim
+    # ate it from the first line only -- so changed_files read that one path
+    # from line[3:] with its first character gone (" M  ranslation/..."), while
+    # every later line was fine. It is the list a user checks before /done
+    # commits everything, so a path that is nearly right is worse than useless.
+    # Two files, both unstaged, because the bug is INVISIBLE with one.
+    (repo / "alpha.md").write_text("alpha\n", encoding="utf-8", newline="\n")
+    (repo / "beta.md").write_text("beta\n", encoding="utf-8", newline="\n")
+    git(["add", "-A"], repo)
+    git(["commit", "-m", "two files to modify"], repo)
+    (repo / "alpha.md").write_text("alpha changed\n", encoding="utf-8", newline="\n")
+    (repo / "beta.md").write_text("beta changed\n", encoding="utf-8", newline="\n")
+    seen = dict((path, status) for status, path in wt_finish.changed_files(repo))
+    check("the FIRST unstaged path keeps its first character",
+          "alpha.md" in seen, sorted(seen))
+    check("so does the second", "beta.md" in seen, sorted(seen))
+    check("both read as modified, not as an unknown status",
+          seen.get("alpha.md") == "M" and seen.get("beta.md") == "M", seen)
+    # And the staged case, whose status occupies the FIRST column instead.
+    git(["add", "alpha.md"], repo)
+    seen = dict((path, status) for status, path in wt_finish.changed_files(repo))
+    check("a staged path survives too", "alpha.md" in seen, sorted(seen))
+    git(["checkout", "--", "."], repo)
+    git(["reset"], repo)
 
     git(["worktree", "remove", "--force", str(wt2)], repo)
     for leftover in LOCK_ROOT.glob("repo-*"):

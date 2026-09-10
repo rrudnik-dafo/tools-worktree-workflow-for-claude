@@ -167,8 +167,15 @@ def changed_files(
     Scans the whole working tree, so it gets the scan-sized limit rather than
     the query default: on a multi-GB repository with a cold cache this is
     seconds to minutes, not milliseconds.
+
+    `strip=False` is load-bearing, not tidiness: porcelain's two status columns
+    are positional, an unstaged change starts with a space, and run_git's
+    default trim would remove it from the first line only -- shifting that one
+    row's path by a character. See run_git's docstring for the measurement.
     """
-    code, out, _ = wt_lib.run_git(["status", "--porcelain"], worktree, timeout=timeout)
+    code, out, _ = wt_lib.run_git(
+        ["status", "--porcelain"], worktree, timeout=timeout, strip=False
+    )
     if code != 0:
         return []
     rows = []
@@ -457,10 +464,15 @@ def merge_phase(args) -> int:
             # and merged by now, so forcing only discards those copies -- but
             # name them first: silently deleting a .env or an .mcp.json the
             # user had put there by hand is a nasty surprise.
+            # strip=False for the same positional-columns reason as
+            # changed_files: this filter happens to be immune (neither "!!" nor
+            # "??" starts with a space), but reading porcelain two ways invites
+            # the next reader to re-derive which way is safe.
             code2, ignored, _ = wt_lib.run_git(
                 ["status", "--porcelain", "--ignored=matching"],
                 worktree,
                 timeout=wt_lib.GIT_SCAN_TIMEOUT,
+                strip=False,
             )
             doomed = [
                 line[3:].strip()

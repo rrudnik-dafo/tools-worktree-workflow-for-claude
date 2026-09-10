@@ -166,7 +166,10 @@ PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 
 
 def run_git(
-    args: list[str], cwd: str | Path, timeout: float = GIT_QUERY_TIMEOUT
+    args: list[str],
+    cwd: str | Path,
+    timeout: float = GIT_QUERY_TIMEOUT,
+    strip: bool = True,
 ) -> tuple[int, str, str]:
     """Run a git command and return (returncode, stdout, stderr), all trimmed.
 
@@ -183,6 +186,14 @@ def run_git(
     TIMEOUT_MARKER so callers can branch on it. Both used to collapse into one
     opaque "git invocation failed", which sent a real diagnosis down the wrong
     path entirely.
+
+    `strip=False` keeps stdout's LEADING whitespace, and is required for output
+    whose meaning lives in fixed columns. `git status --porcelain` is the case:
+    an unstaged change begins with a space (" M path"), and trimming eats it --
+    but only on the FIRST line, so a parser reading the path at line[3:] loses
+    that path's first character while every later line stays intact. Measured
+    2026-09-10: /done listed " M  ranslation/reports/de-en-drift.html" in the
+    file list a user is meant to check before committing.
     """
     try:
         proc = subprocess.run(
@@ -203,7 +214,8 @@ def run_git(
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return 1, "", f"git could not be started: {exc}"
-    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    out = proc.stdout.strip() if strip else proc.stdout.rstrip("\r\n")
+    return proc.returncode, out, proc.stderr.strip()
 
 
 def timed_out(stderr: str) -> bool:
