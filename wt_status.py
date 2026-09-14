@@ -49,12 +49,32 @@ def main() -> int:
         print(f"  protected paths: {', '.join(config['protectedPaths'])}")
 
     print()
-    report = wt_lib.format_inventory(inventory, include_current=True)
+    report = wt_lib.format_inventory(
+        inventory, include_current=True, include_sessions=True
+    )
     if report:
         print("Worktrees:")
         print(report)
     else:
         print("No worktrees. Every session is sharing the main checkout.")
+
+    # Conversations whose worktree is already gone. They are listed apart from
+    # the inventory above because git no longer knows about them at all -- and
+    # they are listed at all because this is the state somebody actually comes
+    # back to: /done ran yesterday, the tab is gone, and the discussion that
+    # produced the work is the only copy of the reasoning behind it.
+    orphans = wt_lib.orphan_session_buckets(main_checkout)
+    if orphans:
+        launcher = wt_lib.claude_launcher()
+        print()
+        print("Conversations from worktrees that no longer exist:")
+        for orphan in orphans:
+            print(f"  {orphan['name']}  (worktree removed)")
+            for line in wt_lib.format_sessions(orphan["sessions"], "    ", launcher):
+                print(line)
+        print("  Reopening one restores its original working directory, which")
+        print("  for these no longer exists -- expect file tools to fail there.")
+        print("  They are readable history, not a place to resume work.")
 
     if swept["unlocked"]:
         print()

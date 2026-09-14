@@ -273,6 +273,32 @@ than a verdict.
 **Session locks live outside your repositories**, under `~/.claude/wt-locks/`,
 so no project needs a `.gitignore` entry for them.
 
+**A worktree's conversations are findable again the next day.** Claude Code
+stores each session's transcript under `~/.claude/projects/<working-directory>/`
+and builds its "recent conversations" picker from the current directory's
+bucket alone. Entering a worktree moves the session's working directory, so the
+conversation is filed under the worktree — and from the main checkout it simply
+does not appear. Nothing is lost: measured on one session, the main bucket kept
+a 110-byte stub holding only the title while the full 4.3 MB transcript sat in
+the worktree's bucket.
+
+`/wt-list` therefore prints, under every worktree, the conversations recorded
+for it, each with a ready `claude --resume <session-id>`. Resume finds a session
+from any directory **and restores its original working directory**, so the
+reopened session is inside its worktree again — verified by resuming a worktree
+session from the main checkout and listing a directory that exists only inside
+that worktree. No editor folder has to change, which is what makes this usable
+when the main checkout is where you actually work and worktrees are side jobs.
+
+Identifying a transcript is deliberately cheap: only a fixed window at each end
+is read, because the title records are re-appended on nearly every turn (one
+88 MB transcript held 697 of them) and the opening prompt sits near the start.
+Cost does not grow with the file.
+
+Conversations belonging to worktrees `/done` has already removed are listed in
+their own section. They reopen, but into a directory that no longer exists —
+history to read, not a place to carry on.
+
 **Claude Code bugs this works around.** `EnterWorktree` compares paths without
 normalising Windows drive-letter case and can refuse to enter a worktree it just
 created ([#36194](https://github.com/anthropics/claude-code/issues/36194) covers

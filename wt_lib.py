@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -815,28 +816,39 @@ def _slug_key(text: str | Path) -> str:
     return re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-")
 
 
+def _transcript_dirs(path: str | Path) -> list[Path]:
+    """Every Claude Code transcript directory that belongs to `path`.
+
+    A LIST rather than one directory on purpose: the bucket name is derived
+    from the working directory, and that derivation is not stable across
+    launches -- the drive letter's case varies, so one directory can end up
+    owning more than one bucket. _slug_key collapses those spellings, and
+    every match is returned.
+    """
+    if not PROJECTS_ROOT.is_dir():
+        return []
+    try:
+        key = _slug_key(Path(path).resolve())
+    except OSError:
+        key = _slug_key(path)
+    try:
+        return [
+            directory
+            for directory in PROJECTS_ROOT.iterdir()
+            if directory.is_dir() and _slug_key(directory.name) == key
+        ]
+    except OSError:
+        return []
+
+
 def transcript_age(path: Path) -> float | None:
     """Seconds since the newest session transcript for `path`, or None.
 
     None means "no transcript directory found" -- genuinely no information,
     which is a different answer from "last touched a long time ago".
     """
-    if not PROJECTS_ROOT.is_dir():
-        return None
-    try:
-        key = _slug_key(path.resolve())
-    except OSError:
-        key = _slug_key(path)
-
-    try:
-        candidates = list(PROJECTS_ROOT.iterdir())
-    except OSError:
-        return None
-
     newest: float | None = None
-    for directory in candidates:
-        if not directory.is_dir() or _slug_key(directory.name) != key:
-            continue
+    for directory in _transcript_dirs(path):
         for transcript in directory.glob("*.jsonl"):
             try:
                 stamp = transcript.stat().st_mtime
@@ -845,6 +857,254 @@ def transcript_age(path: Path) -> float | None:
             if newest is None or stamp > newest:
                 newest = stamp
     return None if newest is None else max(0.0, time.time() - newest)
+
+
+# ---------------------------------------------------------------------------
+# naming the conversations a worktree holds
+# ---------------------------------------------------------------------------
+# Why this section exists (measured 2026-09-14). Claude Code keys its session
+# transcripts on the WORKING DIRECTORY, and the "recent conversations" picker
+# is built from the current directory's bucket alone. EnterWorktree moves a
+# session's working directory mid-flight, so a session that starts in the main
+# checkout and then enters a worktree leaves a near-empty stub behind in the
+# main bucket -- one measured example was 110 bytes holding nothing but the
+# title -- while the entire 4.3 MB conversation lands in the worktree's bucket.
+# The next day, from the main checkout, that conversation is invisible.
+#
+# It is not lost, and it does not even need the worktree to be re-entered:
+# `claude --resume <session-id>` finds a session from ANY directory and brings
+# its original working directory back with it. Verified by resuming a worktree
+# session from the main checkout and globbing a path that exists only inside
+# the worktree -- the worktree's files came back, not the main checkout's.
+#
+# So the only thing missing was the session id. That is what this section
+# recovers, and /wt-list prints.
+
+# How much of a transcript is read to identify it. Transcripts are append-only
+# and reach tens of megabytes, but everything needed to NAME one sits at the
+# two ends: the opening prompt near the head, and the newest title record at
+# the tail. Both `custom-title` and `ai-title` are re-appended on almost every
+# turn -- one 88 MB transcript carried 697 copies of each -- so the last one is
+# the current name and the first one can be stale. Reading a fixed window from
+# each end makes the cost independent of file size.
+TRANSCRIPT_HEAD_BYTES = 256 * 1024
+TRANSCRIPT_TAIL_BYTES = 256 * 1024
+
+# Below this, a transcript with no readable prompt is a relocation stub rather
+# than a conversation: the residue EnterWorktree leaves in the old bucket.
+TRANSCRIPT_STUB_BYTES = 4096
+
+
+def _json_lines(blob: str, drop_first: bool) -> list[dict]:
+    """Parse whole JSON records out of a partial slice of a .jsonl file.
+
+    A window cut at a byte offset almost always splits a line, so the torn
+    edge is discarded: the tail's first line, and the head's last line, which
+    `json.loads` would reject anyway.
+    """
+    lines = blob.splitlines()
+    if drop_first and lines:
+        lines = lines[1:]
+    records = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def _message_text(record: dict) -> str:
+    """The human-visible text of a user record, or '' if it carries none."""
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = str(block.get("text", "")).strip()
+                if text:
+                    return text
+    return ""
+
+
+def _opening_prompt(records: list[dict]) -> str:
+    """The first thing the human actually typed, as a one-line label.
+
+    Everything the harness injects around that first prompt is filtered out:
+    sidechain (sub-agent) turns, meta records, and the reminder/selection
+    blocks that arrive as user records wrapped in angle brackets.
+    """
+    for record in records:
+        if record.get("type") != "user" or record.get("isSidechain"):
+            continue
+        if record.get("isMeta"):
+            continue
+        text = _message_text(record)
+        if not text or text.startswith("<"):
+            continue
+        return " ".join(text.split())
+    return ""
+
+
+def session_digest(transcript: Path) -> dict | None:
+    """Identify one session transcript without reading all of it.
+
+    Returns its id, a human-readable label and the label's provenance, plus
+    size and mtime. `stub` marks the residue described above, so callers can
+    keep it out of a report without having to guess from the size alone.
+    """
+    try:
+        size = transcript.stat().st_size
+        mtime = transcript.stat().st_mtime
+    except OSError:
+        return None
+
+    try:
+        with transcript.open("rb") as handle:
+            head = handle.read(TRANSCRIPT_HEAD_BYTES)
+            if size > TRANSCRIPT_HEAD_BYTES + TRANSCRIPT_TAIL_BYTES:
+                handle.seek(-TRANSCRIPT_TAIL_BYTES, os.SEEK_END)
+                tail = handle.read()
+            else:
+                tail = b""
+    except OSError:
+        return None
+
+    head_records = _json_lines(head.decode("utf-8", "replace"), drop_first=False)
+    tail_records = _json_lines(tail.decode("utf-8", "replace"), drop_first=True)
+
+    # Titles are searched newest-first across both windows, and a title the
+    # user set outranks one the model generated.
+    title, title_source = "", ""
+    for kind, field in (("custom-title", "customTitle"), ("ai-title", "aiTitle")):
+        for record in reversed(tail_records + head_records):
+            if record.get("type") != kind:
+                continue
+            value = str(record.get(field) or record.get("title") or "").strip()
+            if value:
+                title, title_source = value, kind
+                break
+        if title:
+            break
+
+    prompt = _opening_prompt(head_records)
+    # The FILE NAME is the session id, and it is the spelling `--resume` takes.
+    # The sessionId carried inside the records is only a fallback: forking a
+    # session writes a new file whose records can still name the ancestor.
+    session_id = transcript.stem
+    if not re.fullmatch(r"[0-9a-fA-F-]{32,40}", session_id):
+        for record in head_records:
+            if record.get("sessionId"):
+                session_id = str(record["sessionId"])
+                break
+    return {
+        "session_id": session_id,
+        "transcript": transcript,
+        "size": size,
+        "mtime": mtime,
+        "title": title or prompt,
+        "title_source": title_source or ("first prompt" if prompt else "none"),
+        "stub": not prompt and size < TRANSCRIPT_STUB_BYTES,
+    }
+
+
+def recent_sessions(path: str | Path, limit: int = 3) -> list[dict]:
+    """The newest conversations recorded for `path`, newest first.
+
+    Relocation stubs are dropped: they name a conversation that lives in
+    another bucket, so listing them here would send the reader to an empty
+    transcript.
+    """
+    found: list[dict] = []
+    for directory in _transcript_dirs(path):
+        for transcript in directory.glob("*.jsonl"):
+            digest = session_digest(transcript)
+            if digest and not digest["stub"]:
+                found.append(digest)
+    found.sort(key=lambda item: item["mtime"], reverse=True)
+    return found[:limit]
+
+
+def orphan_session_buckets(main: Path) -> list[dict]:
+    """Conversations recorded for worktrees of this repo that are gone.
+
+    The worktree inventory is built from git, so a worktree already removed by
+    /done drops out of it entirely -- taking its conversations off the report
+    with it. Those are exactly the ones somebody comes looking for the next
+    day, so they are collected separately, straight from the transcript store.
+
+    The worktree name is recovered from the bucket name, which is lossy (the
+    slug cannot tell a '-' in the name from a path separator). It is a label
+    for a human, never used to address anything.
+    """
+    if not PROJECTS_ROOT.is_dir():
+        return []
+    root_key = _slug_key((main / ".claude" / "worktrees"))
+    live = set()
+    for entry in list_worktrees(main):
+        if not entry["is_main"]:
+            live.add(_slug_key(entry["path"]))
+
+    orphans: list[dict] = []
+    try:
+        candidates = list(PROJECTS_ROOT.iterdir())
+    except OSError:
+        return []
+    for directory in candidates:
+        if not directory.is_dir():
+            continue
+        key = _slug_key(directory.name)
+        if not key.startswith(root_key + "-") or key in live:
+            continue
+        sessions = [
+            digest
+            for digest in (
+                session_digest(transcript)
+                for transcript in directory.glob("*.jsonl")
+            )
+            if digest and not digest["stub"]
+        ]
+        if not sessions:
+            continue
+        sessions.sort(key=lambda item: item["mtime"], reverse=True)
+        orphans.append(
+            {
+                "name": key[len(root_key) + 1 :],
+                "bucket": directory,
+                "sessions": sessions,
+            }
+        )
+    orphans.sort(key=lambda item: item["sessions"][0]["mtime"], reverse=True)
+    return orphans
+
+
+def claude_launcher() -> str:
+    """How to spell `claude` on this machine, for a copy-pasteable command.
+
+    PATH first. Failing that, the binary the VS Code extension ships with --
+    on a machine where Claude Code is only ever used through the extension,
+    `claude` is on no PATH at all, and a resume command naming a binary that
+    cannot be found is worse than no command.
+    """
+    found = shutil.which("claude")
+    if found:
+        return "claude"
+    extensions = Path.home() / ".vscode" / "extensions"
+    candidates = sorted(
+        extensions.glob("anthropic.claude-code-*/resources/native-binary/claude.exe")
+    )
+    if candidates:
+        return str(candidates[-1])
+    return "claude"
 
 
 def prune_locks(main: Path, max_age_days: int = 7) -> None:
@@ -955,9 +1215,39 @@ def collect_inventory(main: Path, current_cwd: str) -> dict:
     return {"base": base, "current": current_wt, "worktrees": rows, "config": config}
 
 
-def format_inventory(inventory: dict, include_current: bool = False) -> str:
+def format_sessions(sessions: list[dict], indent: str, launcher: str) -> list[str]:
+    """Render conversations as report lines, with the command to reopen each.
+
+    The resume command is the whole point of printing these: it is what turns
+    "there was a conversation here yesterday" into something actionable from
+    the main checkout, without changing any editor's folder.
+    """
+    lines = []
+    for entry in sessions:
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(entry["mtime"]))
+        label = entry["title"] or "(no title)"
+        if len(label) > 64:
+            label = label[:61] + "..."
+        lines.append(
+            f"{indent}{stamp}  {entry['size'] / 1048576:.1f} MB  "
+            f"[{entry['title_source']}]  {label}"
+        )
+        lines.append(f"{indent}  reopen: {launcher} --resume {entry['session_id']}")
+    return lines
+
+
+def format_inventory(
+    inventory: dict,
+    include_current: bool = False,
+    include_sessions: bool = False,
+) -> str:
     """Render the inventory as a compact ASCII table, or '' when there is
-    nothing worth reporting."""
+    nothing worth reporting.
+
+    `include_sessions` is off by default because it reads transcripts, and the
+    SessionStart hook -- the other caller -- runs on every single session and
+    must stay cheap. /wt-list turns it on.
+    """
     rows = [
         row
         for row in inventory["worktrees"]
@@ -1008,6 +1298,13 @@ def format_inventory(inventory: dict, include_current: bool = False) -> str:
         lines.append(f"  {row['branch'] or '(detached)'} {marker}")
         lines.append(f"    {row['path']}")
         lines.append(f"    {', '.join(bits)}  ({row['source']})")
+        if include_sessions:
+            sessions = recent_sessions(row["path"])
+            if sessions:
+                lines.append("    conversations:")
+                lines.extend(format_sessions(sessions, "      ", claude_launcher()))
+            else:
+                lines.append("    conversations: none recorded")
     return "\n".join(lines)
 
 

@@ -19,12 +19,44 @@ Present the result as a short table. The status markers mean:
 | `[unknown - no data, ask]` | predates this workflow; nothing is known |
 
 For anything marked `IN USE`, propose nothing. Do not offer to finish, remove
-or enter it, and do not edit files inside it. Report it as context only.
+or enter it, and do not edit files inside it. Report it as context only. That
+includes its conversations: never offer to reopen one, because the tab holding
+it is open right now and two live sessions on one transcript overwrite each
+other's turns.
+
+## Conversations
+
+Under each worktree the report lists the conversations recorded for it, newest
+first, each with a `reopen:` command. Present them as part of that worktree's
+entry, not as a separate table.
+
+This is the answer to "where did yesterday's chat go". Claude Code keys its
+session history on the working directory, and the picker only ever shows the
+current directory's history — so a conversation that entered a worktree is
+invisible from the main checkout even though nothing was lost. The listed
+`claude --resume <id>` reopens it from wherever you are **and brings its
+original working directory back with it**, so the reopened session is inside
+its worktree again. Nobody has to change an editor folder.
+
+The `[...]` before each title says where the title came from: `custom-title`
+is the name the user gave it, `ai-title` one Claude Code generated, and
+`first prompt` means the conversation was never named and the opening request
+is being shown instead.
+
+A final section, `Conversations from worktrees that no longer exist`, covers
+the worktrees `/done` has already removed. Those reopen too, but their working
+directory is gone, so file tools inside them will fail. Offer them as history
+to read, never as a place to resume work — if the user wants to continue that
+line of work, the answer is a fresh worktree.
 
 For `closed`, `quiet` and `unknown`, offer the user a choice:
 
 - keep it as is;
-- resume in it now (`EnterWorktree` with that path);
+- reopen its last conversation (the `reopen:` command), which is the option to
+  name FIRST when the user is looking for work they left unfinished — it comes
+  back with its history and its worktree, where entering the worktree afresh
+  gives the worktree and an empty conversation;
+- resume in it now with an empty conversation (`EnterWorktree` with that path);
 - finish it (`/done` must be run from inside it, so offer to enter it first);
 - remove it.
 
