@@ -55,8 +55,8 @@ script will refuse to run. Confirm you are back in the main checkout.
 ```
 
 It reads the handover left by phase 3, so no arguments are needed. It merges
-with `--no-ff`, removes the worktree, deletes the branch, and pushes the base
-branch only if `pushAfterMerge` is set.
+with `--no-ff`, runs the post-merge gate, removes the worktree, deletes the
+branch, and pushes the base branch only if `pushAfterMerge` is set.
 
 Handling the outcomes:
 
@@ -64,11 +64,23 @@ Handling the outcomes:
   branch with uncommitted changes, or files arriving with the merge are also
   edited locally. Report exactly which, and let the user decide. Do not stash
   or commit their files to get past it.
-- **exit 2 (merge conflict)** — the merge was aborted and nothing was lost; the
-  branch and worktree still hold the work. Report the conflicting files and
+- **exit 2 with a merge conflict** — the merge was aborted and nothing was lost;
+  the branch and worktree still hold the work. Report the conflicting files and
   offer to resolve them.
-- **warnings about the worktree or branch not being removed** — the merge
-  succeeded regardless. Report the manual command the script printed.
+- **exit 2 with POST-MERGE GATE FAILED** — different situation, and say so
+  plainly: the merge IS in the base branch and does not pass the repo's checks.
+  Nothing was cleaned up, so the branch and worktree are still there to fix it
+  from. Report what failed and offer the two ways out the script prints — fix
+  forward and rerun, or undo. Never run the undo (`git reset --hard`) yourself:
+  it also discards anything merged after.
+- **exit 2 after a timeout** — the script could not tell what the merge did and
+  says which of the three states it found. Follow what it says; do not rerun
+  blindly.
+- **NOTE about an empty directory left behind** — the merge and cleanup both
+  succeeded. A running process holds the directory as its working directory, so
+  it cannot be removed now; it is recorded and swept automatically by a later
+  session. Nothing to do, and do NOT suggest `git worktree remove` — git has
+  already dropped the entry, so that command fails.
 
 Report at the end: what was merged, whether the base branch was pushed, and
 anything left for the user to do.
