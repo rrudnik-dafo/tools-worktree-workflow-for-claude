@@ -164,7 +164,7 @@ looks identical to an abandoned one. Nothing is removed on their strength.
 /wt [name]     move this session into an isolated worktree
 /wt-list       show every worktree, what it holds, who is attending it
 /done          finish: commit, gate, merge, clean up
-/recall <id>   pull a past conversation's substance into this session
+/wt-recall <id>  pull a past conversation's substance into this session
 ```
 
 `/wt` creates `.claude/worktrees/<name>` on branch `worktree-<name>`, branched
@@ -300,16 +300,16 @@ Conversations belonging to worktrees `/done` has already removed are listed in
 their own section. They reopen, but into a directory that no longer exists —
 history to read, not a place to carry on.
 
-**`/recall` is the answer when a terminal is not wanted.** Resuming needs one,
+**`/wt-recall` is the answer when a terminal is not wanted.** Resuming needs one,
 and the VS Code extension has no command for it — its manifest contributes
 three commands, all about diffs — so on that setup reopening a conversation
-always means leaving the editor. `/recall <id>` instead READS the transcript
+always means leaving the editor. `/wt-recall <id>` instead READS the transcript
 and reports what was in it: every prompt the user typed, the repository files
 that changed, the commands that ran, and how it ended. The session carries on
 in the tab the user is already in.
 
 The trade is exactness. `claude --resume` gives the original conversation;
-`/recall` gives a new one holding a digest — the decisions, not the turn-by-turn
+`/wt-recall` gives a new one holding a digest — the decisions, not the turn-by-turn
 reasoning between them. The transcript is opened read-only, so recalling a
 session another tab has open cannot disturb it. Scratch scripts written to the
 temp directory are counted apart from repository files: on one measured session
@@ -498,12 +498,12 @@ Package layout:
 ```
 install.py         install for this machine, and --init-repo for a repository
 policy.md          behaviour rules, injected into ~/.claude/CLAUDE.md
-commands/          source of the slash commands (wt, done, wt-list, recall)
+commands/          source of the slash commands (wt, done, wt-list, wt-recall)
 wt_lib.py          core: git plumbing, session locks, worktree inventory
 wt_hook.py         all lifecycle hooks, one entry point
 wt_create.py       worktree creation (/wt)
 wt_status.py       inventory report (/wt-list)
-wt_recall.py       read a past transcript into the current session (/recall)
+wt_recall.py       read a past transcript into the current session (/wt-recall)
 wt_finish.py       the two-phase finish (/done)
 test_workflow.py   end-to-end rehearsal in a throwaway repository
 ```

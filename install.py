@@ -40,7 +40,7 @@ from pathlib import Path
 
 PKG = Path(__file__).resolve().parent
 CLAUDE_HOME = Path.home() / ".claude"
-COMMAND_NAMES = ("wt.md", "done.md", "wt-list.md", "recall.md")
+COMMAND_NAMES = ("wt.md", "done.md", "wt-list.md", "wt-recall.md")
 
 POLICY_START = "<!-- wt-policy:start -->"
 POLICY_END = "<!-- wt-policy:end -->"
