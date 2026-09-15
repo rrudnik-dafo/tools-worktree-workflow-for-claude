@@ -40,7 +40,7 @@ from pathlib import Path
 
 PKG = Path(__file__).resolve().parent
 CLAUDE_HOME = Path.home() / ".claude"
-COMMAND_NAMES = ("wt.md", "done.md", "wt-list.md")
+COMMAND_NAMES = ("wt.md", "done.md", "wt-list.md", "recall.md")
 
 POLICY_START = "<!-- wt-policy:start -->"
 POLICY_END = "<!-- wt-policy:end -->"
@@ -280,7 +280,7 @@ def check_environment(uv_path: str | None) -> list[str]:
         notes.append("git: NOT FOUND -- the workflow needs git on PATH")
     for name in (
         "wt_lib.py", "wt_hook.py", "wt_status.py", "wt_finish.py",
-        "wt_create.py", "test_workflow.py",
+        "wt_create.py", "wt_recall.py", "test_workflow.py",
     ):
         state = "ok" if (PKG / name).is_file() else "MISSING"
         notes.append(f"{state:<4} {name}")
