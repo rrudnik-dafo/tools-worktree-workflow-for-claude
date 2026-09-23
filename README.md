@@ -164,7 +164,8 @@ looks identical to an abandoned one. Nothing is removed on their strength.
 /wt [name]     move this session into an isolated worktree
 /wt-list       show every worktree, what it holds, who is attending it
 /done          finish: commit, gate, merge, clean up
-/wt-recall <id>  pull a past conversation's substance into this session
+/wt-recall [id]  pull a past conversation's substance into this session
+                 (no id: list what there is)
 ```
 
 `/wt` creates `.claude/worktrees/<name>` on branch `worktree-<name>`, branched
@@ -307,6 +308,12 @@ always means leaving the editor. `/wt-recall <id>` instead READS the transcript
 and reports what was in it: every prompt the user typed, the repository files
 that changed, the commands that ran, and how it ended. The session carries on
 in the tab the user is already in.
+
+Called without an id it lists instead: every conversation recorded for this
+repository — its own bucket and all its worktree buckets — newest first. Asking
+to recall without saying what is exactly the case where the id is the thing the
+user does not have, so erroring out there would send them elsewhere for
+something this command can answer itself.
 
 The trade is exactness. `claude --resume` gives the original conversation;
 `/wt-recall` gives a new one holding a digest — the decisions, not the turn-by-turn

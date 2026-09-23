@@ -5,21 +5,25 @@ description: Pull a past conversation's substance into this session, without a t
 The user wants to carry on work from an earlier conversation, in THIS tab.
 
 `$ARGUMENTS` is a session id (any prefix works, including the 8-character short
-form), or the name of a worktree, or a description of the work. If it is not
-already an id, run `/wt-list` first and pick the matching conversation from the
-report — confirm the choice with the user when more than one could fit, showing
-the titles and dates rather than guessing.
+form), or the name of a worktree, or a description of the work.
 
-Then run:
+**With no arguments**, run the script with none either — it lists the
+conversations recorded for this repository, newest first, with their ids,
+titles and dates. Show that list and ask which one. Do not choose for the user.
+
+**With a description instead of an id**, run the same listing and match it
+against the titles and dates yourself. Confirm before recalling whenever more
+than one could fit, showing what you are choosing between.
 
 ```
+~/.local/bin/uv run --no-project ~/.claude/scripts/wt/wt_recall.py
 ~/.local/bin/uv run --no-project ~/.claude/scripts/wt/wt_recall.py <id>
 ```
 
-Useful flags: `--prompts 0` quotes every prompt instead of the last 40,
-`--chars 0` stops clipping long ones, `--out <path>` writes the report to a
-file rather than stdout (use it when the report is large enough to be worth
-keeping).
+Useful flags: `--list N` lengthens the listing (default 15), `--prompts 0`
+quotes every prompt instead of the last 40, `--chars 0` stops clipping long
+ones, `--out <path>` writes the report to a file rather than stdout (use it
+when the report is large enough to be worth keeping).
 
 The script reads the transcript and prints: the titles, the working directories
 the session passed through, every prompt the user typed, the repository files

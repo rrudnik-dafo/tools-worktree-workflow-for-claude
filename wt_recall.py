@@ -318,13 +318,86 @@ def render(transcript: Path, data: dict, limit: int, tail_chars: int) -> list[st
     return lines
 
 
+def list_sessions(limit: int) -> int:
+    """Answer 'which conversations are there?' -- the no-argument case.
+
+    Asking to recall without saying what is a reasonable thing to type when the
+    id is exactly what the user does not have. Erroring out sends them to
+    /wt-list for something this script can answer itself, so it lists instead.
+
+    Scope is this repository when we are inside one: its own bucket plus every
+    worktree bucket, which share the main checkout's slug as a prefix. Outside
+    a repository there is nothing to narrow by, so everything is listed.
+    """
+    root = wt_lib.PROJECTS_ROOT
+    if not root.is_dir():
+        print(f"No transcript store at {root}.")
+        print("NOK: nothing to list")
+        return 1
+
+    main_checkout = wt_lib.find_main_checkout(str(Path.cwd()))
+    prefix = wt_lib._slug_key(main_checkout) if main_checkout else ""
+    scope = str(main_checkout) if main_checkout else "every project"
+
+    found: list[tuple[dict, str]] = []
+    for bucket in root.iterdir():
+        if not bucket.is_dir():
+            continue
+        if prefix and not wt_lib._slug_key(bucket.name).startswith(prefix):
+            continue
+        for transcript in bucket.glob("*.jsonl"):
+            digest = wt_lib.session_digest(transcript)
+            # Relocation stubs are skipped for the same reason /wt-list skips
+            # them: they name a conversation that is stored somewhere else.
+            if digest and not digest["stub"]:
+                found.append((digest, bucket.name))
+
+    if not found:
+        print(f"No conversations recorded for {scope}.")
+        print("NOK: nothing to list")
+        return 1
+
+    found.sort(key=lambda item: item[0]["mtime"], reverse=True)
+    print(f"Conversations recorded for {scope}, newest first:")
+    print()
+    for digest, bucket in found[:limit]:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(digest["mtime"]))
+        label = digest["title"] or "(no title)"
+        if len(label) > 60:
+            label = label[:57] + "…"
+        print(f"  {digest['session_id']}")
+        print(
+            f"    {when}  {digest['size'] / 1048576:.1f} MB  "
+            f"[{digest['title_source']}]  {label}"
+        )
+        print(f"    in {bucket}")
+    if len(found) > limit:
+        print()
+        print(f"  … and {len(found) - limit} older (raise --list)")
+    print()
+    print("Recall one with:  wt_recall.py <id>   (a prefix is enough)")
+    print(f"OK: listed {min(limit, len(found))} of {len(found)} conversations")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Print the substance of a past Claude Code session."
+        description="Print the substance of a past Claude Code session. "
+        "With no session given, list the ones on offer."
     )
     parser.add_argument(
         "session",
-        help="session id, or any prefix of it (the 8-character short form works)",
+        nargs="?",
+        help="session id, or any prefix of it (the 8-character short form "
+        "works). Omit it to list the conversations available instead.",
+    )
+    parser.add_argument(
+        "--list",
+        type=int,
+        default=15,
+        metavar="N",
+        help="how many conversations to list when no session is given "
+        "(default: 15)",
     )
     parser.add_argument(
         "--prompts",
@@ -351,6 +424,9 @@ def main() -> int:
         help="write the report to this file instead of stdout",
     )
     args = parser.parse_args()
+
+    if not args.session:
+        return list_sessions(args.list)
 
     hits = find_transcript(args.session)
     if not hits:
